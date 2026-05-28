@@ -615,41 +615,41 @@ The following traces a real query through two iterations: **"What's the warranty
 
 ```mermaid
 sequenceDiagram
-    participant Loop as ReACT Loop
+    participant RL as ReACT Loop
     participant LLM as LLM Service
     participant Val as Param Validator
     participant Tool as Tool Service
     participant DB as PostgreSQL
 
-    Note over Loop: Iteration 1 starts
-    Note over Loop: react_history = "No previous reasoning steps."
+    Note over RL: Iteration 1 starts
+    Note over RL: react_history = "No previous reasoning steps."
 
-    Loop->>LLM: System prompt + User prompt + empty history
-    LLM-->>Loop: Thought: User wants warranty and price.<br/>I will check warranty first.<br/>Action: warranty_check({"product_name":"UltraWasher 8262"})
+    RL->>LLM: System prompt + User prompt + empty history
+    LLM-->>RL: Thought: User wants warranty and price.<br/>I will check warranty first.<br/>Action: warranty_check({"product_name":"UltraWasher 8262"})
 
-    Note over Loop: parse_react_output() extracts:<br/>thought, action="warranty_check",<br/>action_input={"product_name":"UltraWasher 8262"},<br/>answer=None
+    Note over RL: parse_react_output() extracts:<br/>thought, action="warranty_check",<br/>action_input={"product_name":"UltraWasher 8262"},<br/>answer=None
 
-    Loop->>Val: Validate params against schema
+    RL->>Val: Validate params against schema
     Note over Val: Required field "product_name"? Present.<br/>Type is string? Yes.<br/>Result: VALID
 
-    Loop->>Tool: ExecuteTool("warranty_check", params)
+    RL->>Tool: ExecuteTool("warranty_check", params)
     Tool->>DB: SELECT warranty_months, price,<br/>manufacturing_date FROM products<br/>WHERE product_name LIKE '%UltraWasher 8262%'
     DB-->>Tool: warranty_months=6, price=121.24,<br/>manufacturing_date=2023-09-21
-    Tool-->>Loop: {"results":[{"product_name":"UltraWasher 8262",<br/>"warranty_months":6,"price":121.24,<br/>"manufacturing_date":"2023-09-21"}],"count":1}
+    Tool-->>RL: {"results":[{"product_name":"UltraWasher 8262",<br/>"warranty_months":6,"price":121.24,<br/>"manufacturing_date":"2023-09-21"}],"count":1}
 
-    Note over Loop: Validate result: no "error" key,<br/>results list non-empty. CLEAN.
+    Note over RL: Validate result: no "error" key,<br/>results list non-empty. CLEAN.
 
-    Note over Loop: Append to steps[]:<br/>{iteration:1, thought, action,<br/>action_input, observation}
+    Note over RL: Append to steps[]:<br/>{iteration:1, thought, action,<br/>action_input, observation}
 
-    Note over Loop: Iteration 2 starts
-    Note over Loop: build_react_history(steps) produces:<br/>"Previous reasoning:<br/>Thought 1: User wants warranty and price...<br/>Action 1: warranty_check({...})<br/>Observation 1: {results:[{warranty_months:6,<br/>price:121.24,...}]}"
+    Note over RL: Iteration 2 starts
+    Note over RL: build_react_history(steps) produces:<br/>"Previous reasoning:<br/>Thought 1: User wants warranty and price...<br/>Action 1: warranty_check({...})<br/>Observation 1: {results:[{warranty_months:6,<br/>price:121.24,...}]}"
 
-    Loop->>LLM: System prompt + User prompt + accumulated history
-    LLM-->>Loop: Thought: The warranty_check already returned<br/>the price ($121.24) and warranty (6 months).<br/>I have everything needed.<br/>Answer: The UltraWasher 8262 is priced at $121.24<br/>and comes with a 6-month warranty from Sept 2023.
+    RL->>LLM: System prompt + User prompt + accumulated history
+    LLM-->>RL: Thought: The warranty_check already returned<br/>the price ($121.24) and warranty (6 months).<br/>I have everything needed.<br/>Answer: The UltraWasher 8262 is priced at $121.24<br/>and comes with a 6-month warranty from Sept 2023.
 
-    Note over Loop: parse_react_output() extracts:<br/>answer="The UltraWasher 8262 is priced at..."<br/>answer is NOT None -> break loop
+    Note over RL: parse_react_output() extracts:<br/>answer="The UltraWasher 8262 is priced at..."<br/>answer is NOT None -> break loop
 
-    Note over Loop: final_answer set, loop exits.<br/>Proceed to Response Framing (Stage 7).
+    Note over RL: final_answer set, loop exits.<br/>Proceed to Response Framing (Stage 7).
 ```
 
 ### How History Accumulates
@@ -1213,28 +1213,28 @@ The ReACT loop only checked one product and produced a partial answer. After fra
 
 ```mermaid
 sequenceDiagram
-    participant Loop as Reflection Loop
+    participant RefL as Reflection Loop
     participant Critic as Evaluator LLM
     participant Improver as Refiner LLM
 
-    Note over Loop: Iteration 1
+    Note over RefL: Iteration 1
 
-    Loop->>Critic: Evaluate: query="Compare warranty..."<br/>response="The UltraWasher 8262 has a 6-month warranty."<br/>tools=["warranty_check"]
-    Critic-->>Loop: completeness=0.3, accuracy=0.8, relevance=0.5,<br/>clarity=0.7, actionability=0.2<br/>overall_score=0.50<br/>issues=["Only one product discussed",<br/>"No RoboCleaner warranty info"]<br/>needs_refinement=true
+    RefL->>Critic: Evaluate: query="Compare warranty..."<br/>response="The UltraWasher 8262 has a 6-month warranty."<br/>tools=["warranty_check"]
+    Critic-->>RefL: completeness=0.3, accuracy=0.8, relevance=0.5,<br/>clarity=0.7, actionability=0.2<br/>overall_score=0.50<br/>issues=["Only one product discussed",<br/>"No RoboCleaner warranty info"]<br/>needs_refinement=true
 
-    Note over Loop: Score 0.50 < 0.75 AND needs_refinement=true
+    Note over RefL: Score 0.50 < 0.75 AND needs_refinement=true
 
-    Loop->>Improver: Refine with critique + tool observations:<br/>"warranty_check: {warranty_months:6, price:121.24}"<br/>"warranty_check: {warranty_months:36, price:249.99}"
-    Improver-->>Loop: "The UltraWasher 8262 has a 6-month warranty<br/>(from Sept 2023, valid through March 2024),<br/>while the RoboCleaner 3000 offers a longer<br/>36-month warranty (from Feb 2024, valid through<br/>Feb 2027). The RoboCleaner provides 30 months<br/>more coverage."<br/>confidence=0.89
+    RefL->>Improver: Refine with critique + tool observations:<br/>"warranty_check: {warranty_months:6, price:121.24}"<br/>"warranty_check: {warranty_months:36, price:249.99}"
+    Improver-->>RefL: "The UltraWasher 8262 has a 6-month warranty<br/>(from Sept 2023, valid through March 2024),<br/>while the RoboCleaner 3000 offers a longer<br/>36-month warranty (from Feb 2024, valid through<br/>Feb 2027). The RoboCleaner provides 30 months<br/>more coverage."<br/>confidence=0.89
 
-    Note over Loop: Response replaced with refined version
+    Note over RefL: Response replaced with refined version
 
-    Note over Loop: Iteration 2
+    Note over RefL: Iteration 2
 
-    Loop->>Critic: Evaluate the refined response
-    Critic-->>Loop: completeness=0.9, accuracy=0.9, relevance=0.95,<br/>clarity=0.9, actionability=0.8<br/>overall_score=0.89<br/>needs_refinement=false
+    RefL->>Critic: Evaluate the refined response
+    Critic-->>RefL: completeness=0.9, accuracy=0.9, relevance=0.95,<br/>clarity=0.9, actionability=0.8<br/>overall_score=0.89<br/>needs_refinement=false
 
-    Note over Loop: Score 0.89 >= 0.75 -> EXIT<br/>Refined response sent to user
+    Note over RefL: Score 0.89 >= 0.75 -> EXIT<br/>Refined response sent to user
 ```
 
 The key mechanism: the refiner LLM receives the **raw tool observations** from the ReACT loop. Even though the ReACT answer only used UltraWasher data, the tool observations contain RoboCleaner results too — the refiner uses this data to produce the complete comparison.
