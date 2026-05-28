@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package agent;
+
+service AgentService {
+  // Process a user query through the ReACT loop, streaming back events
+  rpc ProcessQuery (AgentRequest) returns (stream AgentEvent);
+
+  // Continue processing after a clarification response
+  rpc SubmitClarification (ClarificationResponse) returns (stream AgentEvent);
+}
+
+message AgentRequest {
+  string session_id = 1;
+  string customer_id = 2;
+  string query = 3;
+}
+
+message ClarificationResponse {
+  string session_id = 1;
+  string selected_option = 2;
+  string freetext = 3;
+}
+
+// Unified streaming event from the agent
+message AgentEvent {
+  string type = 1;  // "token", "clarification", "agent_thinking", "response_complete", "recommendations", "error"
+  string payload = 2;  // JSON-encoded payload specific to the type
+}

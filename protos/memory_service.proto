@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package memory;
+
+service MemoryService {
+  // Session management (PostgreSQL)
+  rpc CreateSession (CreateSessionRequest) returns (SessionResponse);
+  rpc GetSession (GetSessionRequest) returns (SessionResponse);
+  rpc TouchSession (TouchSessionRequest) returns (SessionResponse);
+
+  // Conversation turns (PostgreSQL + Redis cache)
+  rpc AddConversationTurn (AddTurnRequest) returns (AddTurnResponse);
+  rpc GetConversationHistory (GetHistoryRequest) returns (GetHistoryResponse);
+
+  // Episodic memory — immutable, stored in TimescaleDB
+  rpc StoreEpisodicMemory (StoreEpisodicRequest) returns (StoreEpisodicResponse);
+  rpc GetEpisodicMemories (GetEpisodicRequest) returns (GetEpisodicResponse);
+
+  // Session audit trail — immutable, stored in TimescaleDB
+  rpc AppendAuditEvent (AuditEventRequest) returns (AuditEventResponse);
+  rpc GetSessionAuditTrail (GetAuditTrailRequest) returns (GetAuditTrailResponse);
+}
+
+// --- Session ---
+
+message CreateSessionRequest {
+  string customer_id = 1;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message TouchSessionRequest {
+  string session_id = 1;
+}
+
+message SessionResponse {
+  string session_id = 1;
+  string customer_id = 2;
+  string created_at = 3;
+  string last_active_at = 4;
+  bool is_new = 5;
+}
+
+// --- Conversation Turns ---
+
+message ConversationTurn {
+  string role = 1;      // "user", "assistant", "system"
+  string content = 2;
+  string intent = 3;
+  float confidence = 4;
+  string tool_calls = 5;  // JSON string
+  string created_at = 6;
+}
+
+message AddTurnRequest {
+  string session_id = 1;
+  string role = 2;
+  string content = 3;
+  string intent = 4;
+  float confidence = 5;
+  string tool_calls = 6;  // JSON string
+}
+
+message AddTurnResponse {
+  string turn_id = 1;
+}
+
+message GetHistoryRequest {
+  string session_id = 1;
+  int32 limit = 2;  // 0 = all
+}
+
+message GetHistoryResponse {
+  repeated ConversationTurn turns = 1;
+}
+
+// --- Episodic Memory (TimescaleDB — immutable) ---
+
+message StoreEpisodicRequest {
+  string customer_id = 1;
+  string session_id = 2;
+  string event_type = 3;   // "session_summary", "topic_snapshot", "resolution_record", "preference_learned"
+  string summary = 4;
+  repeated string key_topics = 5;
+  string resolution_status = 6;
+  string metadata = 7;     // JSON string for additional context
+}
+
+message StoreEpisodicResponse {
+  string memory_id = 1;
+}
+
+message GetEpisodicRequest {
+  string customer_id = 1;
+  int32 limit = 2;
+  string event_type = 3;   // optional filter by event type
+}
+
+message GetEpisodicResponse {
+  repeated EpisodicMemory memories = 1;
+}
+
+message EpisodicMemory {
+  string memory_id = 1;
+  string event_type = 2;
+  string summary = 3;
+  repeated string key_topics = 4;
+  string resolution_status = 5;
+  string metadata = 6;     // JSON string
+  string created_at = 7;
+}
+
+// --- Session Audit Trail (TimescaleDB — immutable) ---
+
+message AuditEventRequest {
+  string session_id = 1;
+  string customer_id = 2;
+  string event_type = 3;   // "session_created", "turn_user", "intent_classified", "tool_executed", etc.
+  string event_data = 4;   // JSON string with event-specific payload
+}
+
+message AuditEventResponse {
+  string event_id = 1;
+}
+
+message GetAuditTrailRequest {
+  string session_id = 1;
+  string event_type = 2;   // optional filter
+  int32 limit = 3;         // 0 = all
+}
+
+message GetAuditTrailResponse {
+  repeated AuditEvent events = 1;
+}
+
+message AuditEvent {
+  string event_id = 1;
+  string session_id = 2;
+  string customer_id = 3;
+  string event_type = 4;
+  string event_data = 5;   // JSON string
+  string event_time = 6;
+}

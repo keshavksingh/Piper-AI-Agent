@@ -1,0 +1,23 @@
+# Environment and secrets
+.env
+certs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.coverage
+htmlcov/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+nul
+.DS_Store
+Thumbs.db
+
+# Generated
+vectorstore/

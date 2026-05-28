@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package recommendation;
+
+service RecommendationService {
+  // Get query suggestions for session start
+  rpc GetStartRecommendations (StartRecommendationRequest) returns (RecommendationResponse);
+
+  // Get follow-up suggestions after a response
+  rpc GetFollowUpRecommendations (FollowUpRecommendationRequest) returns (RecommendationResponse);
+}
+
+message StartRecommendationRequest {
+  string customer_id = 1;
+  string session_id = 2;
+}
+
+message FollowUpRecommendationRequest {
+  string session_id = 1;
+  string last_query = 2;
+  string last_response = 3;
+  string intent = 4;
+  string customer_id = 5;
+}
+
+message RecommendationResponse {
+  repeated string suggestions = 1;
+}

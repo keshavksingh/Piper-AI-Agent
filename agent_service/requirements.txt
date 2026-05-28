@@ -1,0 +1,6 @@
+grpcio==1.80.0
+grpcio-tools==1.80.0
+protobuf==6.31.1
+python-dotenv==1.1.0
+structlog==24.4.0
+tenacity==9.0.0

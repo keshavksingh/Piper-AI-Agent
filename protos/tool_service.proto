@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package tool;
+
+service ToolService {
+  // List all available tools (for agent context)
+  rpc ListTools (ListToolsRequest) returns (ListToolsResponse);
+
+  // Execute a specific tool
+  rpc ExecuteTool (ExecuteToolRequest) returns (ExecuteToolResponse);
+}
+
+message ListToolsRequest {}
+
+message ToolDefinition {
+  string name = 1;
+  string description = 2;
+  string parameter_schema = 3;  // JSON string
+}
+
+message ListToolsResponse {
+  repeated ToolDefinition tools = 1;
+}
+
+message ExecuteToolRequest {
+  string session_id = 1;
+  string tool_name = 2;
+  string parameters = 3;  // JSON string
+}
+
+message ExecuteToolResponse {
+  bool success = 1;
+  string result = 2;       // JSON string with tool output
+  string error = 3;        // Error message if failed
+  int32 execution_time_ms = 4;
+}

@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package knowledge;
+
+service KnowledgeService {
+  rpc RetrieveRelevantDocs (KnowledgeRequest) returns (KnowledgeResponse);
+}
+
+message KnowledgeRequest {
+  string query = 1;
+  int32 top_k = 2;  // Number of results; defaults to 5 if 0
+}
+
+message ProductDocument {
+  string product_id = 1;
+  string product_name = 2;
+  string description = 3;
+  double price = 4;
+  int32 warranty_months = 5;
+  string manufacturing_date = 6;
+  double similarity_score = 7;
+}
+
+message KnowledgeResponse {
+  repeated string documents = 1;              // Formatted text (backward compat)
+  repeated ProductDocument products = 2;      // Structured results
+}

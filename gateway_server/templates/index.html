@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Piper AI Agent</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0b0b10;
+            min-height: 100vh;
+        }
+
+        button, input, textarea, select {
+            font-family: inherit;
+        }
+
+        /* ── Login Form ──────────────────────────────────── */
+
+        #login-container {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            height: 100vh;
+            padding: 20px;
+            background: #0b0b10;
+        }
+
+        #login-form {
+            width: 100%;
+            max-width: 380px;
+            background: #16161e;
+            border-radius: 20px;
+            padding: 48px 36px 40px;
+            box-shadow: 0 8px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+        }
+
+        .login-brand {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .login-brand-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, #5b8def, #34d399);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            color: #fff;
+            font-weight: 700;
+            margin-bottom: 16px;
+        }
+
+        .login-brand h2 {
+            color: #e8e8ec;
+            font-size: 22px;
+            font-weight: 600;
+            letter-spacing: -0.3px;
+            margin-bottom: 6px;
+        }
+
+        .login-brand p {
+            color: #55556a;
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 18px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: #8888a0;
+            margin-bottom: 7px;
+            font-weight: 500;
+        }
+
+        .input-with-icon {
+            position: relative;
+        }
+
+        .input-icon {
+            position: absolute;
+            left: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 16px;
+            height: 16px;
+            color: #55556a;
+            pointer-events: none;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 12px 14px 12px 40px;
+            font-size: 14px;
+            border: 1px solid #2a2a3e;
+            border-radius: 10px;
+            outline: none;
+            background: #0e0e14;
+            color: #e8e8ec;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .form-group input:focus {
+            border-color: #5b8def;
+            box-shadow: 0 0 0 3px rgba(91, 141, 239, 0.12);
+        }
+
+        .form-group input:focus + .input-icon,
+        .input-with-icon:focus-within .input-icon {
+            color: #5b8def;
+        }
+
+        .form-group input::placeholder {
+            color: #44445a;
+        }
+
+        #login-btn {
+            width: 100%;
+            padding: 12px;
+            font-size: 15px;
+            background: #5b8def;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            margin-top: 6px;
+            font-weight: 600;
+            letter-spacing: 0.2px;
+        }
+
+        #login-btn:hover:not(:disabled) { background: #4a7de0; }
+        #login-btn:active:not(:disabled) { transform: scale(0.98); }
+        #login-btn:disabled { background: #2a2a3e; cursor: not-allowed; color: #55556a; }
+
+        #login-error {
+            color: #f87171;
+            font-size: 13px;
+            text-align: center;
+            margin-top: 14px;
+            display: none;
+        }
+
+        /* ── Chat UI ─────────────────────────────────────── */
+
+        #chat-container {
+            display: none;
+            flex-direction: column;
+            height: 100vh;
+            background: #111118;
+            color: #e8e8ec;
+        }
+
+        /* ── Top Bar ─────────────────────────────────────── */
+
+        #top-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 24px;
+            border-bottom: 1px solid #1e1e2e;
+            flex-shrink: 0;
+        }
+
+        #app-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #34d399;
+            letter-spacing: 0.5px;
+        }
+
+        .user-info {
+            font-size: 13px;
+            color: #9a9aad;
+        }
+
+        .user-info a {
+            color: #5b8def;
+            cursor: pointer;
+            text-decoration: none;
+            margin-left: 12px;
+        }
+
+        .user-info a:hover {
+            text-decoration: underline;
+        }
+
+        /* ── Chat Body (scrollable area) ─────────────────── */
+
+        #chat-body {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #chat-body.welcome-active {
+            justify-content: center;
+            align-items: center;
+        }
+
+        #chat-body.welcome-active #chatbox {
+            display: none;
+        }
+
+        #chat-body:not(.welcome-active) #welcome-screen {
+            display: none;
+        }
+
+        /* ── Welcome Screen ──────────────────────────────── */
+
+        #welcome-screen {
+            text-align: center;
+            padding: 40px 20px;
+        }
+
+        #welcome-greeting {
+            font-size: 36px;
+            font-weight: 400;
+            background: linear-gradient(135deg, #5b8def, #34d399);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 12px;
+        }
+
+        #welcome-subtitle {
+            font-size: 15px;
+            color: #6a6a7e;
+        }
+
+        /* ── Chatbox (messages area) ─────────────────────── */
+
+        #chatbox {
+            flex: 1;
+            padding: 24px 20px;
+            max-width: 768px;
+            width: 100%;
+            margin: 0 auto;
+        }
+
+        /* ── Messages ─────────────────────────────────────── */
+
+        .message {
+            margin-bottom: 24px;
+            line-height: 1.7;
+            max-width: 100%;
+            word-wrap: break-word;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .user-message {
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .user-message .msg-content {
+            background: #2a2a40;
+            padding: 12px 20px;
+            border-radius: 20px;
+            max-width: 75%;
+            color: #e8e8ec;
+            font-size: 15px;
+        }
+
+        .assistant-message {
+            color: #d0d0dc;
+            font-size: 15px;
+        }
+
+        .assistant-message .msg-content {
+            max-width: 100%;
+        }
+
+        .copy-btn {
+            background: none;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            padding: 4px 6px;
+            cursor: pointer;
+            color: #55556a;
+            opacity: 0;
+            transition: opacity 0.2s, color 0.2s, border-color 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-top: 4px;
+        }
+
+        .assistant-message:hover .copy-btn {
+            opacity: 1;
+        }
+
+        .copy-btn:hover {
+            color: #5b8def;
+            border-color: #2a2a40;
+            background: #1e1e2e;
+        }
+
+        .copy-btn.copied {
+            color: #34d399;
+            opacity: 1;
+        }
+
+        .copy-btn svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        .assistant-message strong {
+            font-weight: 600;
+            color: #e8e8ec;
+        }
+
+        .assistant-message em {
+            font-style: italic;
+        }
+
+        .assistant-message code {
+            background: #2a2a40;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.9em;
+            color: #a5b4fc;
+        }
+
+        .error-message .msg-content {
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.2);
+            color: #f87171;
+            padding: 10px 16px;
+            border-radius: 12px;
+            font-size: 13px;
+        }
+
+        .response-meta {
+            font-size: 12px;
+            color: #6a6a7e;
+            padding: 0 0 16px;
+        }
+
+        /* ── Bottom Area ─────────────────────────────────── */
+
+        #bottom-area {
+            padding: 8px 20px 16px;
+            max-width: 768px;
+            width: 100%;
+            margin: 0 auto;
+            flex-shrink: 0;
+        }
+
+        #suggestions {
+            display: none;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+            justify-content: center;
+        }
+
+        .suggestion-btn {
+            padding: 8px 18px;
+            border: 1px solid #2a2a40;
+            background: #1e1e2e;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #c8c8d8;
+            transition: all 0.2s;
+        }
+
+        .suggestion-btn:hover {
+            border-color: #5b8def;
+            color: #5b8def;
+            background: rgba(91, 141, 239, 0.08);
+        }
+
+        .suggestion-btn.suggestion-disabled {
+            pointer-events: none;
+            opacity: 0.35;
+        }
+
+        #input-container {
+            display: flex;
+            align-items: center;
+            background: #1e1e2e;
+            border-radius: 28px;
+            border: 1px solid #2a2a40;
+            padding: 4px 4px 4px 8px;
+            transition: border-color 0.2s;
+        }
+
+        #input-container:focus-within {
+            border-color: #4a4a65;
+        }
+
+        #userinput {
+            flex: 1;
+            padding: 12px 16px;
+            font-size: 16px;
+            border: none;
+            outline: none;
+            background: transparent;
+            color: #e8e8ec;
+        }
+
+        #userinput::placeholder {
+            color: #6a6a7e;
+        }
+
+        #userinput.input-disabled {
+            color: #4a4a5e;
+            cursor: not-allowed;
+        }
+
+        #sendbtn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            background: #5b8def;
+            color: #fff;
+            cursor: pointer;
+            border-radius: 50%;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s, opacity 0.2s;
+            flex-shrink: 0;
+        }
+
+        #sendbtn:hover:not(.btn-disabled) { background: #4a7de0; }
+
+        #sendbtn.btn-disabled {
+            background: #2a2a40;
+            color: #4a4a5e;
+            cursor: not-allowed;
+        }
+
+        #footer-note {
+            text-align: center;
+            font-size: 12px;
+            color: #4a4a5e;
+            margin-top: 10px;
+        }
+
+        /* ── Clarification ────────────────────────────────── */
+
+        .clarification-message .msg-content {
+            background: rgba(251, 191, 36, 0.08);
+            border: 1px solid rgba(251, 191, 36, 0.15);
+            padding: 14px 18px;
+            border-radius: 12px;
+            color: #d0d0dc;
+            font-size: 14px;
+        }
+
+        .clarification-options {
+            margin-top: 12px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .clarification-btn {
+            padding: 7px 16px;
+            border: 1px solid #3a3a55;
+            background: #1e1e2e;
+            color: #c8c8d8;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+
+        .clarification-btn:hover {
+            background: #5b8def;
+            color: #fff;
+            border-color: #5b8def;
+        }
+
+        .clarification-freetext {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+            width: 100%;
+        }
+
+        .clarification-freetext input {
+            flex: 1;
+            padding: 8px 14px;
+            border: 1px solid #3a3a55;
+            border-radius: 8px;
+            font-size: 13px;
+            background: #252540;
+            color: #e8e8ec;
+            outline: none;
+        }
+
+        .clarification-freetext input:focus {
+            border-color: #5b8def;
+        }
+
+        .clarification-freetext button {
+            padding: 8px 16px;
+            background: #5b8def;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: background 0.2s;
+        }
+
+        .clarification-freetext button:hover {
+            background: #4a7de0;
+        }
+
+        /* ── Guardrail Indicators ────────────────────────── */
+
+        .guardrail-blocked-message .msg-content {
+            background: rgba(248, 113, 113, 0.08);
+            border: 1px solid rgba(248, 113, 113, 0.15);
+            padding: 12px 16px;
+            border-radius: 12px;
+            color: #f87171;
+            font-size: 13px;
+        }
+
+        .guardrail-icon {
+            font-weight: bold;
+            margin-right: 4px;
+        }
+
+        /* ── Reasoning Panel ────────────────────────────── */
+
+        .reasoning-panel {
+            margin-bottom: 16px;
+            border: 1px solid #2a2a40;
+            border-radius: 12px;
+            background: #1a1a28;
+            overflow: hidden;
+        }
+
+        .reasoning-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            cursor: pointer;
+            user-select: none;
+            font-size: 13px;
+            color: #9a9aad;
+        }
+
+        .reasoning-header:hover {
+            background: #1e1e2e;
+        }
+
+        .reasoning-toggle {
+            font-size: 10px;
+            color: #6a6a7e;
+            width: 14px;
+            text-align: center;
+        }
+
+        .reasoning-title {
+            font-weight: 500;
+            color: #c8c8d8;
+        }
+
+        .reasoning-count {
+            font-size: 12px;
+            color: #6a6a7e;
+            margin-left: auto;
+        }
+
+        .reasoning-pulse {
+            color: #5b8def;
+            font-size: 16px;
+            line-height: 1;
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+
+        .reasoning-body {
+            max-height: 300px;
+            overflow-y: auto;
+            padding: 0 16px 10px;
+            transition: max-height 0.3s ease, padding 0.3s ease, opacity 0.3s ease;
+        }
+
+        .reasoning-body.reasoning-collapsed {
+            max-height: 0;
+            padding: 0 16px;
+            opacity: 0;
+            overflow: hidden;
+        }
+
+        .reasoning-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding: 4px 0;
+            font-size: 12px;
+            line-height: 1.5;
+            color: #9a9aad;
+        }
+
+        .reasoning-badge {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 500;
+            white-space: nowrap;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+
+        .badge-thinking { background: rgba(96, 165, 250, 0.15); color: #60a5fa; }
+        .badge-planning { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
+        .badge-agent { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+        .badge-reflection { background: rgba(167, 139, 250, 0.15); color: #a78bfa; }
+        .badge-tool { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+        .badge-learning { background: rgba(167, 139, 250, 0.15); color: #a78bfa; }
+        .badge-guardrail { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+
+        .reasoning-text {
+            flex: 1;
+            min-width: 0;
+            word-wrap: break-word;
+        }
+
+        .reasoning-complete .reasoning-header {
+            color: #4a4a5e;
+        }
+
+        .reasoning-complete .reasoning-title {
+            color: #6a6a7e;
+            font-style: italic;
+        }
+
+        .reasoning-complete .reasoning-pulse {
+            display: none;
+        }
+
+        /* ── Reflection Score (inside reasoning steps) ──── */
+
+        .reflection-score {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: 600;
+            font-style: normal;
+            margin-right: 4px;
+        }
+
+        .score-good { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+        .score-ok { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+        .score-low { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+
+        /* ── Plan Steps (inside reasoning) ───────────────── */
+
+        .plan-steps {
+            margin-top: 6px;
+            padding-left: 4px;
+        }
+
+        .plan-step {
+            margin-bottom: 4px;
+            font-size: 12px;
+            color: #9a9aad;
+        }
+
+        .step-num {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: rgba(56, 189, 248, 0.15);
+            color: #38bdf8;
+            text-align: center;
+            font-size: 11px;
+            line-height: 18px;
+            margin-right: 6px;
+            font-weight: 600;
+        }
+
+        .step-tool {
+            color: #6a6a7e;
+            font-size: 11px;
+        }
+
+        .agent-check {
+            color: #34d399;
+            font-weight: bold;
+        }
+
+        /* ── Custom Scrollbar ────────────────────────────── */
+
+        #chat-body::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        #chat-body::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        #chat-body::-webkit-scrollbar-thumb {
+            background: #2a2a40;
+            border-radius: 3px;
+        }
+
+        #chat-body::-webkit-scrollbar-thumb:hover {
+            background: #3a3a55;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Login Form -->
+<div id="login-container">
+    <div id="login-form">
+        <div class="login-brand">
+            <div class="login-brand-icon">P</div>
+            <h2>Piper AI Agent</h2>
+            <p>Sign in to continue</p>
+        </div>
+        <div class="form-group">
+            <label for="login-email">Email</label>
+            <div class="input-with-icon">
+                <input type="email" id="login-email" placeholder="you@example.com" autocomplete="email">
+                <svg class="input-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 4L12 13 2 4"/></svg>
+            </div>
+        </div>
+        <div class="form-group">
+            <label for="login-password">Password</label>
+            <div class="input-with-icon">
+                <input type="password" id="login-password" placeholder="Enter your password" autocomplete="current-password">
+                <svg class="input-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            </div>
+        </div>
+        <button id="login-btn">Sign In</button>
+        <div id="login-error"></div>
+    </div>
+</div>
+
+<!-- Chat UI (hidden until authenticated) -->
+<div id="chat-container">
+    <div id="top-bar">
+        <span id="app-title">Piper</span>
+        <div class="user-info">
+            <span id="user-display-name"></span>
+            <a id="logout-link">Sign out</a>
+        </div>
+    </div>
+    <div id="chat-body" class="welcome-active">
+        <div id="welcome-screen">
+            <h1 id="welcome-greeting">What can I help with?</h1>
+            <p id="welcome-subtitle">Ask about products, pricing, warranties, and more</p>
+        </div>
+        <div id="chatbox"></div>
+    </div>
+    <div id="bottom-area">
+        <div id="suggestions"></div>
+        <div id="input-container">
+            <input type="text" id="userinput" placeholder="Ask Piper">
+            <button id="sendbtn" aria-label="Send">&#10148;</button>
+        </div>
+        <div id="footer-note">Piper may make mistakes. Verify important information.</div>
+    </div>
+</div>
+
+<script src="/static/websocket.js"></script>
+
+</body>
+</html>

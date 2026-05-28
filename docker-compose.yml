@@ -1,0 +1,261 @@
+services:
+  # ── Infrastructure ──────────────────────────────────────────────
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: piper
+      POSTGRES_PASSWORD: piper
+      POSTGRES_DB: piper
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piper"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: piper
+      POSTGRES_PASSWORD: piper
+      POSTGRES_DB: piper_ts
+    volumes:
+      - tsdata:/var/lib/postgresql/data
+      - ./db/timescaledb_init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piper -d piper_ts"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Application Services ────────────────────────────────────────
+
+  knowledge_service:
+    build:
+      context: .
+      dockerfile: knowledge_service/Dockerfile
+    ports:
+      - "50052:50052"
+    environment:
+      - DATABASE_URL=postgresql://piper:piper@postgres:5432/piper
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost',50052),2); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  llm_service:
+    build:
+      context: .
+      dockerfile: llm_service/Dockerfile
+    ports:
+      - "50053:50053"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost',50053),2); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  memory_service:
+    build:
+      context: .
+      dockerfile: memory_service/Dockerfile
+    ports:
+      - "50055:50055"
+    environment:
+      - DATABASE_URL=postgresql://piper:piper@postgres:5432/piper
+      - TIMESCALEDB_URL=postgresql://piper:piper@timescaledb:5432/piper_ts
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost',50055),2); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  tool_service:
+    build:
+      context: .
+      dockerfile: tool_service/Dockerfile
+    ports:
+      - "50056:50056"
+    environment:
+      - DATABASE_URL=postgresql://piper:piper@postgres:5432/piper
+      - KNOWLEDGE_SERVICE_ADDR=knowledge_service:50052
+    depends_on:
+      postgres:
+        condition: service_healthy
+      knowledge_service:
+        condition: service_healthy
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost',50056),2); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  recommendation_service:
+    build:
+      context: .
+      dockerfile: recommendation_service/Dockerfile
+    ports:
+      - "50057:50057"
+    environment:
+      - DATABASE_URL=postgresql://piper:piper@postgres:5432/piper
+      - MEMORY_SERVICE_ADDR=memory_service:50055
+      - LLM_SERVICE_ADDR=llm_service:50053
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      memory_service:
+        condition: service_healthy
+      llm_service:
+        condition: service_healthy
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost',50057),2); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  agent_service:
+    build:
+      context: .
+      dockerfile: agent_service/Dockerfile
+    ports:
+      - "50054:50054"
+    environment:
+      - MEMORY_SERVICE_ADDR=memory_service:50055
+      - LLM_SERVICE_ADDR=llm_service:50053
+      - KNOWLEDGE_SERVICE_ADDR=knowledge_service:50052
+      - TOOL_SERVICE_ADDR=tool_service:50056
+      - RECOMMENDATION_SERVICE_ADDR=recommendation_service:50057
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - REFLECTION_ENABLED=${REFLECTION_ENABLED:-true}
+      - REFLEXION_ENABLED=${REFLEXION_ENABLED:-true}
+      - TOOL_VALIDATION_ENABLED=${TOOL_VALIDATION_ENABLED:-true}
+      - PLANNING_ENABLED=${PLANNING_ENABLED:-true}
+      - PLANNING_TEMPERATURE=${PLANNING_TEMPERATURE:-0.2}
+      - PLANNING_MAX_TOKENS=${PLANNING_MAX_TOKENS:-512}
+      - MULTI_AGENT_ENABLED=${MULTI_AGENT_ENABLED:-true}
+      - MULTI_AGENT_MAX_AGENTS=${MULTI_AGENT_MAX_AGENTS:-3}
+      - GUARDRAILS_ENABLED=${GUARDRAILS_ENABLED:-true}
+      - GUARDRAILS_MAX_QUERY_LENGTH=${GUARDRAILS_MAX_QUERY_LENGTH:-2000}
+      - EVALUATION_STORAGE_ENABLED=${EVALUATION_STORAGE_ENABLED:-true}
+    depends_on:
+      memory_service:
+        condition: service_healthy
+      llm_service:
+        condition: service_healthy
+      knowledge_service:
+        condition: service_healthy
+      tool_service:
+        condition: service_healthy
+      recommendation_service:
+        condition: service_healthy
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost',50054),2); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  gateway_server:
+    build:
+      context: .
+      dockerfile: gateway_server/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - AGENT_SERVICE_ADDR=agent_service:50054
+      - MEMORY_SERVICE_ADDR=memory_service:50055
+      - RECOMMENDATION_SERVICE_ADDR=recommendation_service:50057
+      - DATABASE_URL=postgresql://piper:piper@postgres:5432/piper
+      - JWT_SECRET=${JWT_SECRET:-piper-dev-secret-change-in-prod}
+    depends_on:
+      agent_service:
+        condition: service_healthy
+      memory_service:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - mynetwork
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  pgdata:
+  tsdata:
+  redisdata:
+
+networks:
+  mynetwork:
+    driver: bridge
