@@ -45,7 +45,63 @@ The Piper AI Agent is a microservices-based conversational AI system where a cen
 | Resilience | tenacity (retry / circuit breaker) |
 | Logging | structlog (structured JSON) |
 
-![High-Level System Overview](images/01-high-level-system-overview.svg)
+```mermaid
+graph TB
+    subgraph Client Layer
+        UI["Web UI<br/>(React + WebSocket)"]
+    end
+
+    subgraph Gateway Layer
+        GW["Gateway Server<br/>WebSocket + JWT Auth<br/>Rate Limiting"]
+    end
+
+    subgraph Orchestration Layer
+        AS["Agent Service<br/>12-Stage Pipeline<br/>ReACT + Multi-Agent"]
+    end
+
+    subgraph Intelligence Layer
+        LLM["LLM Service<br/>Claude claude-sonnet-4-20250514<br/>Prompt Routing"]
+        KS["Knowledge Service<br/>Voyage Embeddings<br/>Semantic Search"]
+    end
+
+    subgraph Execution Layer
+        TS["Tool Service<br/>4 Domain Tools<br/>Param Validation"]
+        RS["Recommendation Service<br/>3-Tier Cold Start<br/>Gap Analysis Engine"]
+    end
+
+    subgraph Memory Layer
+        MS["Memory Service<br/>Sessions + History<br/>Episodic Memories"]
+    end
+
+    subgraph Storage Layer
+        PG[("PostgreSQL<br/>Sessions, Products<br/>Conversations")]
+        TS_DB[("TimescaleDB<br/>Episodic Memories<br/>Audit Trail")]
+        RD[("Redis<br/>Session Cache<br/>TTL: 1800s")]
+    end
+
+    UI <-->|"WebSocket"| GW
+    GW <-->|"gRPC Stream"| AS
+    AS <-->|"gRPC"| LLM
+    AS <-->|"gRPC"| TS
+    AS <-->|"gRPC"| MS
+    AS <-->|"gRPC"| RS
+    TS <-->|"gRPC"| KS
+    MS <--> PG
+    MS <--> TS_DB
+    MS <--> RD
+
+    style UI fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style GW fill:#F5A623,stroke:#C47D0E,color:#fff
+    style AS fill:#D0021B,stroke:#9B0016,color:#fff
+    style LLM fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style KS fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style TS fill:#50C878,stroke:#3A9A5C,color:#fff
+    style RS fill:#50C878,stroke:#3A9A5C,color:#fff
+    style MS fill:#FF6B6B,stroke:#CC5555,color:#fff
+    style PG fill:#336791,stroke:#264E6D,color:#fff
+    style TS_DB fill:#336791,stroke:#264E6D,color:#fff
+    style RD fill:#DC382D,stroke:#A82B23,color:#fff
+```
 
 ---
 
@@ -53,7 +109,24 @@ The Piper AI Agent is a microservices-based conversational AI system where a cen
 
 Each service runs as an independent gRPC server. All inter-service communication uses Protocol Buffers.
 
-![Proto Contracts](images/02-proto-contracts.svg)
+```mermaid
+graph LR
+    subgraph "Proto Contracts"
+        P1["agent_service.proto<br/>ProcessQuery (stream)<br/>SubmitClarification (stream)"]
+        P2["memory_service.proto<br/>CreateSession, GetSession<br/>AddTurn, GetHistory<br/>StoreEpisodic, GetEpisodic"]
+        P3["tool_service.proto<br/>ListTools<br/>ExecuteTool"]
+        P4["llm_service.proto<br/>GenerateAnswer"]
+        P5["knowledge_service.proto<br/>SemanticSearch"]
+        P6["recommendation_service.proto<br/>GetStartRecommendations<br/>GetFollowUpRecommendations"]
+    end
+
+    style P1 fill:#D0021B,stroke:#9B0016,color:#fff
+    style P2 fill:#FF6B6B,stroke:#CC5555,color:#fff
+    style P3 fill:#50C878,stroke:#3A9A5C,color:#fff
+    style P4 fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style P5 fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style P6 fill:#50C878,stroke:#3A9A5C,color:#fff
+```
 
 | Service                    | Address             | Role                                                      |
 | -------------------------- | ------------------- | --------------------------------------------------------- |
@@ -67,7 +140,32 @@ Each service runs as an independent gRPC server. All inter-service communication
 
 ### Request Flow Summary
 
-![Request Flow Summary](images/03-request-flow-summary.svg)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as Gateway
+    participant AG as Agent
+    participant MEM as Memory
+    participant LLM as LLM
+    participant REC as Recommendation
+
+    C->>GW: POST /api/login {email, password}
+    GW->>GW: Verify bcrypt password
+    GW-->>C: {token: "JWT..."}
+    C->>GW: WebSocket connect
+    C->>GW: {type: "session_start", token: "JWT..."}
+    GW->>GW: Verify JWT, extract user_id
+    GW->>MEM: Load/create session (user_id)
+    GW->>REC: Get start recommendations
+    GW-->>C: {"type":"recommendations", ...}
+
+    C->>GW: {"type":"user_message", "text":"..."}
+    GW->>AG: ProcessQuery(session_id, query)
+    Note over AG: Pipeline stages 0-12 (see Section 3)
+    AG-->>GW: Stream events (tokens, indicators, response_complete)
+    GW-->>C: {"type":"token", ...}
+    GW-->>C: {"type":"response_complete", ...}
+```
 
 ---
 
@@ -75,7 +173,75 @@ Each service runs as an independent gRPC server. All inter-service communication
 
 Every user query flows through a deterministic 12-stage pipeline inside `ProcessQuery()`. Each stage is independently feature-flagged.
 
-![12-Stage Query Pipeline](images/04-twelve-stage-pipeline.svg)
+```mermaid
+flowchart TD
+    START(["User Query Received"])
+
+    S0["Stage 0: Session Context<br/>Touch session, load last 10 turns"]
+    S1{"Stage 1: Input Guardrails<br/>Length, injection, PII checks"}
+    S1_BLOCK(["BLOCKED<br/>guardrail_blocked event"])
+
+    S2["Stage 2: Intent Classification<br/>LLM classifies intent + confidence<br/>temp=0.1, max_tokens=256"]
+    S3{"Stage 3: Clarification<br/>confidence below 0.8?"}
+    S3_ASK(["ASK USER<br/>clarification event"])
+
+    S4["Stage 4: Planning Layer<br/>LLM decomposes into sub-goals<br/>Decides single vs multi-agent<br/>temp=0.2, max_tokens=512"]
+    S4_EVENT["Emit: agent_planning"]
+
+    S5{"Stage 5: Routing<br/>Simple intent?<br/>Multi-agent?"}
+    S5_SIMPLE["Direct LLM Response<br/>No tools needed"]
+    S5_MULTI["Multi-Agent Loop<br/>Up to 3 specialists"]
+    S5_REACT["Single ReACT Loop<br/>Up to 8 iterations"]
+
+    S7["Stage 7: Response Framing<br/>LLM polishes answer<br/>Adds confidence + sources"]
+    S8["Stage 8: Reflection<br/>Evaluate quality (5 criteria)<br/>Refine if score below 0.75<br/>Max 2 refinement cycles"]
+    S9["Stage 9: Output Guardrails<br/>PII redaction"]
+    S10{"Stage 10: Reflexion<br/>Original score below 0.7?"}
+    S10_YES["Generate + Store Insight<br/>to TimescaleDB episodic memory<br/>Emit: reflexion_learning"]
+    S10_NO["Skip storage"]
+    S11["Stage 11: Evaluation Storage<br/>Metrics to TimescaleDB"]
+    S12["Stage 12: Recommendations<br/>+ Token Streaming<br/>Emit: response_complete"]
+
+    START --> S0 --> S1
+    S1 -->|"Safe"| S2
+    S1 -->|"Blocked"| S1_BLOCK
+    S2 --> S3
+    S3 -->|"Needs clarification"| S3_ASK
+    S3 -->|"Confident"| S4
+    S4 --> S4_EVENT --> S5
+    S5 -->|"general_question<br/>or out_of_scope"| S5_SIMPLE
+    S5 -->|"needs_multi_agent=true"| S5_MULTI
+    S5 -->|"Single agent"| S5_REACT
+    S5_SIMPLE --> S12
+    S5_MULTI --> S7
+    S5_REACT --> S7
+    S7 --> S8 --> S9 --> S10
+    S10 -->|"Score below 0.7"| S10_YES --> S11
+    S10 -->|"Score at or above 0.7"| S10_NO --> S11
+    S11 --> S12
+
+    style START fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style S0 fill:#6C757D,stroke:#495057,color:#fff
+    style S1 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style S1_BLOCK fill:#DC3545,stroke:#A71D2A,color:#fff
+    style S2 fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style S3 fill:#FFC107,stroke:#CC9A06,color:#000
+    style S3_ASK fill:#FFC107,stroke:#CC9A06,color:#000
+    style S4 fill:#17A2B8,stroke:#117A8B,color:#fff
+    style S4_EVENT fill:#17A2B8,stroke:#117A8B,color:#fff
+    style S5 fill:#6F42C1,stroke:#59359A,color:#fff
+    style S5_SIMPLE fill:#28A745,stroke:#1E7E34,color:#fff
+    style S5_MULTI fill:#E83E8C,stroke:#B5305F,color:#fff
+    style S5_REACT fill:#FD7E14,stroke:#CA6510,color:#fff
+    style S7 fill:#20C997,stroke:#199B76,color:#fff
+    style S8 fill:#6610F2,stroke:#510EC0,color:#fff
+    style S9 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style S10 fill:#E65100,stroke:#BF4400,color:#fff
+    style S10_YES fill:#E65100,stroke:#BF4400,color:#fff
+    style S10_NO fill:#6C757D,stroke:#495057,color:#fff
+    style S11 fill:#6C757D,stroke:#495057,color:#fff
+    style S12 fill:#4A90D9,stroke:#2C5F8A,color:#fff
+```
 
 ---
 
@@ -272,7 +438,69 @@ All methods on `AgentServiceServicer` in `agent_service/server.py`:
 
 The core reasoning loop implements the **ReACT** (Reasoning + Acting) framework. The agent alternates between thinking and tool execution until it has enough information to answer.
 
-![ReACT Reasoning Engine](images/05-react-reasoning-engine.svg)
+```mermaid
+flowchart TD
+    ENTRY(["Enter ReACT Loop"])
+
+    LOAD_INSIGHTS["Load Reflexion Insights<br/>from episodic memory<br/>(up to 3 past learnings)"]
+    INJECT_PLAN["Inject Plan Steps<br/>into system prompt"]
+
+    BUILD["Build System Prompt<br/>= Base Prompt<br/>+ Reflexion Context<br/>+ Plan Steps<br/>+ Tool Descriptions"]
+
+    ITER{"Iteration i<br/>(max 8)"}
+    TIMEOUT{"Elapsed > 120s?"}
+    TIMEOUT_MSG["Return timeout message"]
+
+    LLM_CALL["LLM Call: _execute_react_step<br/>temp=0.3, max_tokens=1024"]
+    PARSE["Parse Output:<br/>Thought + Action or Answer"]
+
+    HAS_ANSWER{"Has Answer?"}
+    HAS_ACTION{"Has Action?"}
+
+    VALIDATE_PARAMS{"Validate Tool Params<br/>Required fields?<br/>Correct types?"}
+    INVALID_PARAMS["Observation: Parameter error<br/>(self-correction hint)"]
+    EXECUTE_TOOL["Execute Tool via<br/>Tool Service gRPC"]
+    VALIDATE_RESULT{"Validate Result<br/>Error keys?<br/>Empty results?"}
+    ENRICH["Enrich Observation<br/>with guidance"]
+    APPEND["Append Step to History<br/>(thought, action, observation)"]
+
+    EMIT_THINK["Emit: agent_thinking<br/>(iteration, thought)"]
+
+    FRAME["Stage 7: Frame Response<br/>LLM polishes final answer"]
+
+    ENTRY --> LOAD_INSIGHTS --> INJECT_PLAN --> BUILD --> ITER
+    ITER --> TIMEOUT
+    TIMEOUT -->|"Yes"| TIMEOUT_MSG
+    TIMEOUT -->|"No"| LLM_CALL
+    LLM_CALL --> PARSE --> EMIT_THINK
+    EMIT_THINK --> HAS_ANSWER
+    HAS_ANSWER -->|"Yes"| FRAME
+    HAS_ANSWER -->|"No"| HAS_ACTION
+    HAS_ACTION -->|"Yes"| VALIDATE_PARAMS
+    HAS_ACTION -->|"No fallback"| FRAME
+    VALIDATE_PARAMS -->|"Valid"| EXECUTE_TOOL
+    VALIDATE_PARAMS -->|"Invalid"| INVALID_PARAMS --> APPEND
+    EXECUTE_TOOL --> VALIDATE_RESULT
+    VALIDATE_RESULT -->|"Clean"| APPEND
+    VALIDATE_RESULT -->|"Issues"| ENRICH --> APPEND
+    APPEND --> ITER
+
+    style ENTRY fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style LOAD_INSIGHTS fill:#E65100,stroke:#BF4400,color:#fff
+    style INJECT_PLAN fill:#17A2B8,stroke:#117A8B,color:#fff
+    style BUILD fill:#6C757D,stroke:#495057,color:#fff
+    style LLM_CALL fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style PARSE fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style EXECUTE_TOOL fill:#50C878,stroke:#3A9A5C,color:#fff
+    style VALIDATE_PARAMS fill:#DC3545,stroke:#A71D2A,color:#fff
+    style VALIDATE_RESULT fill:#DC3545,stroke:#A71D2A,color:#fff
+    style FRAME fill:#20C997,stroke:#199B76,color:#fff
+    style EMIT_THINK fill:#FFC107,stroke:#CC9A06,color:#000
+    style TIMEOUT fill:#DC3545,stroke:#A71D2A,color:#fff
+    style TIMEOUT_MSG fill:#DC3545,stroke:#A71D2A,color:#fff
+    style INVALID_PARAMS fill:#FFC107,stroke:#CC9A06,color:#000
+    style ENRICH fill:#FFC107,stroke:#CC9A06,color:#000
+```
 
 ### ReACT Output Format
 
@@ -298,7 +526,26 @@ Answer: The RoboCleaner 3000 has a longer warranty at 36 months compared
 
 Every tool call passes through a two-phase validation gate:
 
-![Tool Validation Pipeline](images/06-tool-validation-pipeline.svg)
+```mermaid
+flowchart LR
+    A["Action:<br/>warranty_check"] --> B{"Parameter<br/>Validation"}
+    B -->|"Missing required<br/>field"| C["Observation:<br/>Missing 'product_name'<br/>Please provide it"]
+    B -->|"Wrong type"| D["Observation:<br/>Expected string<br/>got integer"]
+    B -->|"Valid"| E["Execute Tool"]
+    E --> F{"Result<br/>Validation"}
+    F -->|"Error key found"| G["Enriched:<br/>Tool returned error<br/>Try alternative"]
+    F -->|"Empty results"| H["Enriched:<br/>No results found<br/>Try broader search"]
+    F -->|"Clean"| I["Raw observation<br/>passed to LLM"]
+
+    style B fill:#DC3545,stroke:#A71D2A,color:#fff
+    style F fill:#DC3545,stroke:#A71D2A,color:#fff
+    style E fill:#50C878,stroke:#3A9A5C,color:#fff
+    style C fill:#FFC107,stroke:#CC9A06,color:#000
+    style D fill:#FFC107,stroke:#CC9A06,color:#000
+    style G fill:#FFC107,stroke:#CC9A06,color:#000
+    style H fill:#FFC107,stroke:#CC9A06,color:#000
+    style I fill:#28A745,stroke:#1E7E34,color:#fff
+```
 
 Invalid parameters are **not blocked** — they're returned as observations so the LLM can self-correct on the next iteration.
 
@@ -306,7 +553,34 @@ Invalid parameters are **not blocked** — they're returned as observations so t
 
 Before the loop begins, the system constructs a composite prompt from four injected sections. This prompt stays constant across all iterations — only the user prompt (with accumulating history) changes per iteration.
 
-![System Prompt Assembly](images/07-system-prompt-assembly.svg)
+```mermaid
+flowchart TD
+    subgraph "System Prompt (constant across iterations)"
+        BASE["Base Persona<br/>'You are Piper, an AI customer<br/>support agent...<br/>You must reason step-by-step<br/>using the ReACT framework.'"]
+        REFL["Reflexion Context<br/>(from past poor interactions)<br/>'Learnings from past interactions:<br/>- When comparing warranties,<br/>  always check both products'"]
+        PLAN["Plan Context<br/>(from Stage 4 planning)<br/>'Execution plan:<br/>1. Look up warranty (warranty_check)<br/>2. Look up price (price_lookup)'"]
+        TOOLS["Tool Descriptions<br/>'product_search(query, top_k)<br/>price_lookup(product_name)<br/>warranty_check(product_name)<br/>product_compare(product_names)'"]
+        RULES["Output Rules<br/>'Pattern 1: Thought + Action<br/>Pattern 2: Thought + Answer'"]
+    end
+
+    subgraph "User Prompt (changes each iteration)"
+        MEM["Session Context<br/>Last 10 conversation turns"]
+        QUERY["User Query<br/>'What is the warranty on<br/>UltraWasher 8262?'"]
+        HIST["ReACT History<br/>(empty on iteration 1,<br/>grows each iteration)"]
+    end
+
+    BASE --> REFL --> PLAN --> TOOLS --> RULES
+    MEM --> QUERY --> HIST
+
+    style BASE fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style REFL fill:#E65100,stroke:#BF4400,color:#fff
+    style PLAN fill:#17A2B8,stroke:#117A8B,color:#fff
+    style TOOLS fill:#50C878,stroke:#3A9A5C,color:#fff
+    style RULES fill:#6C757D,stroke:#495057,color:#fff
+    style MEM fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style QUERY fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style HIST fill:#FFC107,stroke:#CC9A06,color:#000
+```
 
 The assembled system prompt sent to the LLM:
 
@@ -339,13 +613,70 @@ Rules:
 
 The following traces a real query through two iterations: **"What's the warranty on UltraWasher 8262 and how much does it cost?"**
 
-![Step-by-Step Iteration Trace](images/08-iteration-trace.svg)
+```mermaid
+sequenceDiagram
+    participant Loop as ReACT Loop
+    participant LLM as LLM Service
+    participant Val as Param Validator
+    participant Tool as Tool Service
+    participant DB as PostgreSQL
+
+    Note over Loop: Iteration 1 starts
+    Note over Loop: react_history = "No previous reasoning steps."
+
+    Loop->>LLM: System prompt + User prompt + empty history
+    LLM-->>Loop: Thought: User wants warranty and price.<br/>I will check warranty first.<br/>Action: warranty_check({"product_name":"UltraWasher 8262"})
+
+    Note over Loop: parse_react_output() extracts:<br/>thought, action="warranty_check",<br/>action_input={"product_name":"UltraWasher 8262"},<br/>answer=None
+
+    Loop->>Val: Validate params against schema
+    Note over Val: Required field "product_name"? Present.<br/>Type is string? Yes.<br/>Result: VALID
+
+    Loop->>Tool: ExecuteTool("warranty_check", params)
+    Tool->>DB: SELECT warranty_months, price,<br/>manufacturing_date FROM products<br/>WHERE product_name LIKE '%UltraWasher 8262%'
+    DB-->>Tool: warranty_months=6, price=121.24,<br/>manufacturing_date=2023-09-21
+    Tool-->>Loop: {"results":[{"product_name":"UltraWasher 8262",<br/>"warranty_months":6,"price":121.24,<br/>"manufacturing_date":"2023-09-21"}],"count":1}
+
+    Note over Loop: Validate result: no "error" key,<br/>results list non-empty. CLEAN.
+
+    Note over Loop: Append to steps[]:<br/>{iteration:1, thought, action,<br/>action_input, observation}
+
+    Note over Loop: Iteration 2 starts
+    Note over Loop: build_react_history(steps) produces:<br/>"Previous reasoning:<br/>Thought 1: User wants warranty and price...<br/>Action 1: warranty_check({...})<br/>Observation 1: {results:[{warranty_months:6,<br/>price:121.24,...}]}"
+
+    Loop->>LLM: System prompt + User prompt + accumulated history
+    LLM-->>Loop: Thought: The warranty_check already returned<br/>the price ($121.24) and warranty (6 months).<br/>I have everything needed.<br/>Answer: The UltraWasher 8262 is priced at $121.24<br/>and comes with a 6-month warranty from Sept 2023.
+
+    Note over Loop: parse_react_output() extracts:<br/>answer="The UltraWasher 8262 is priced at..."<br/>answer is NOT None -> break loop
+
+    Note over Loop: final_answer set, loop exits.<br/>Proceed to Response Framing (Stage 7).
+```
 
 ### How History Accumulates
 
 The critical mechanism is `build_react_history()` — each iteration's thought, action, and observation are appended to a growing history string. On every subsequent LLM call, the model sees **all** previous reasoning, giving it memory within the loop.
 
-![How History Accumulates](images/09-history-accumulation.svg)
+```mermaid
+flowchart TD
+    subgraph "Iteration 1 — LLM sees"
+        H1["react_history:<br/>'No previous reasoning steps.'"]
+    end
+
+    subgraph "Iteration 2 — LLM sees"
+        H2["react_history:<br/>'Previous reasoning:<br/>Thought 1: User wants warranty and price...<br/>Action 1: warranty_check({product_name:...})<br/>Observation 1: {results:[{warranty_months:6,<br/>price:121.24}], count:1}'"]
+    end
+
+    subgraph "Iteration 3 — LLM sees"
+        H3["react_history:<br/>'Previous reasoning:<br/>Thought 1: ...<br/>Action 1: warranty_check({...})<br/>Observation 1: {results:[...]}<br/>Thought 2: Now I need the competing product...<br/>Action 2: warranty_check({product_name:RoboCleaner})<br/>Observation 2: {results:[{warranty_months:36}]}'"]
+    end
+
+    H1 -->|"+ step 1 appended"| H2
+    H2 -->|"+ step 2 appended"| H3
+
+    style H1 fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style H2 fill:#17A2B8,stroke:#117A8B,color:#fff
+    style H3 fill:#7B68EE,stroke:#5A4ACB,color:#fff
+```
 
 Each step entry has a fixed structure:
 
@@ -361,7 +692,37 @@ Each step entry has a fixed structure:
 
 The ReACT loop has five built-in recovery paths. None of them crash the loop — they all produce an observation that guides the LLM to fix its own mistake.
 
-![Self-Correction Mechanisms](images/10-self-correction-mechanisms.svg)
+```mermaid
+flowchart TD
+    ERR1["Invalid Parameters<br/>LLM sends wrong field name<br/>or wrong type"]
+    ERR2["Empty Results<br/>Tool returns zero matches"]
+    ERR3["Unknown Tool<br/>LLM hallucinates a tool name"]
+    ERR4["Timeout<br/>Pipeline exceeds 120 seconds"]
+    ERR5["Max Iterations<br/>8 iterations with no Answer"]
+
+    FIX1["Observation becomes:<br/>'Missing required field product_name.<br/>Please fix the parameters<br/>and try again.'<br/>LLM self-corrects next iteration"]
+    FIX2["Observation enriched with:<br/>'No results found. Consider<br/>broadening your search or<br/>using different terms.'<br/>LLM tries alternative query"]
+    FIX3["Observation becomes:<br/>'Unknown tool: check_inventory.<br/>Available tools: product_search,<br/>price_lookup, warranty_check,<br/>product_compare'<br/>LLM picks a valid tool"]
+    FIX4["Loop breaks immediately.<br/>Returns: 'I am taking too long<br/>to process your request.<br/>Please try a simpler question.'"]
+    FIX5["Compiles all observations<br/>collected so far into a<br/>best-effort answer:<br/>'Based on what I found:<br/>- warranty_check: {results...}<br/>- price_lookup: {results...}'"]
+
+    ERR1 --> FIX1
+    ERR2 --> FIX2
+    ERR3 --> FIX3
+    ERR4 --> FIX4
+    ERR5 --> FIX5
+
+    style ERR1 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style ERR2 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style ERR3 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style ERR4 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style ERR5 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style FIX1 fill:#28A745,stroke:#1E7E34,color:#fff
+    style FIX2 fill:#FFC107,stroke:#CC9A06,color:#000
+    style FIX3 fill:#28A745,stroke:#1E7E34,color:#fff
+    style FIX4 fill:#6C757D,stroke:#495057,color:#fff
+    style FIX5 fill:#6C757D,stroke:#495057,color:#fff
+```
 
 **Example: Self-correction in action over two iterations**
 
@@ -448,7 +809,31 @@ When the ReACT engine calls `product_search`, the query doesn't do keyword match
 
 At system startup, `scripts/seed_products.py` embeds every product in the catalog. Each product is converted to a rich text string before embedding, combining name, description, price, and warranty into a single semantic representation:
 
-![Ingestion Pipeline](images/11-ingestion-pipeline.svg)
+```mermaid
+flowchart LR
+    subgraph "Product Record"
+        PR["UltraWasher 8262<br/>Description: Superior performance<br/>and durability<br/>Price: $121.24<br/>Warranty: 6 months"]
+    end
+
+    subgraph "Text Preparation"
+        TXT["Formatted string:<br/>'UltraWasher 8262: Offers superior<br/>performance and durability.<br/>Price: $121.24.<br/>Warranty: 6 months.'"]
+    end
+
+    subgraph "Voyage AI API"
+        EMB["voyage-3 model<br/>Returns 1024-dim vector<br/>[0.123, -0.456, 0.789, ...]"]
+    end
+
+    subgraph "PostgreSQL + pgvector"
+        DB["product_embeddings table<br/>product_id: UUID (FK)<br/>embedding: vector(1024)<br/>IVFFlat index"]
+    end
+
+    PR --> TXT --> EMB --> DB
+
+    style PR fill:#336791,stroke:#264E6D,color:#fff
+    style TXT fill:#6C757D,stroke:#495057,color:#fff
+    style EMB fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style DB fill:#336791,stroke:#264E6D,color:#fff
+```
 
 Products are processed in batches of 10 with a 21-second pause between batches (Voyage AI free-tier limit: 3 requests per minute). The script tracks which products already have embeddings to support resume-on-failure.
 
@@ -456,7 +841,38 @@ Products are processed in batches of 10 with a 21-second pause between batches (
 
 When a user asks _"Tell me about UltraWasher"_, the ReACT engine calls `product_search`. Here is the exact path through all four services:
 
-![Query-Time Search Chain](images/12-query-time-search.svg)
+```mermaid
+sequenceDiagram
+    participant Agent as Agent Service
+    participant Tool as Tool Service
+    participant Know as Knowledge Service
+    participant Voyage as Voyage AI API
+    participant PG as PostgreSQL + pgvector
+
+    Note over Agent: ReACT Iteration 1
+    Agent->>Agent: LLM outputs Action: product_search({"query":"UltraWasher"})
+    Agent->>Tool: gRPC ExecuteTool(tool_name="product_search", params)
+
+    Note over Tool: tool_product_search handler
+    Tool->>Know: gRPC RetrieveRelevantDocs(query="UltraWasher", top_k=5)
+
+    Note over Know: Step 1: Embed the query
+    Know->>Voyage: vo_client.embed(["UltraWasher"], model="voyage-3")
+    Voyage-->>Know: [[0.118, -0.442, 0.801, ...]]  (1024 floats)
+
+    Note over Know: Step 2: pgvector cosine search
+    Know->>PG: SELECT p.*, 1-(pe.embedding <=> query_vec) AS similarity FROM product_embeddings pe JOIN products p ON pe.product_id = p.id ORDER BY pe.embedding <=> query_vec LIMIT 5
+    PG-->>Know: UltraWasher 8262 (0.952), MegaBlender 4455 (0.341), ...
+
+    Note over Know: Step 3: Build response
+    Know-->>Tool: KnowledgeResponse(products=[ProductDocument, ...])
+
+    Note over Tool: Format as JSON
+    Tool-->>Agent: {"results":[{"product_name":"UltraWasher 8262","similarity_score":0.952,...}],"count":1}
+
+    Note over Agent: Observation fed back into ReACT loop
+    Agent->>Agent: LLM sees result, produces Answer on next iteration
+```
 
 ### The Cosine Similarity Math
 
@@ -472,7 +888,47 @@ The SQL then converts distance to a similarity score:
 1 - (pe.embedding <=> query_vector) AS similarity
 ```
 
-![Cosine Similarity Math](images/13-cosine-similarity.svg)
+```mermaid
+flowchart LR
+    subgraph "Query Vector"
+        QV["embed('UltraWasher')<br/>[0.118, -0.442, 0.801, ...]"]
+    end
+
+    subgraph "Product Vectors in DB"
+        PV1["UltraWasher 8262<br/>[0.121, -0.438, 0.799, ...]"]
+        PV2["RoboCleaner 3000<br/>[-0.305, 0.612, -0.114, ...]"]
+        PV3["EcoKettle 7200<br/>[0.445, -0.021, 0.337, ...]"]
+    end
+
+    subgraph "Cosine Distance"
+        D1["distance = 0.048<br/>similarity = 0.952"]
+        D2["distance = 0.816<br/>similarity = 0.184"]
+        D3["distance = 0.659<br/>similarity = 0.341"]
+    end
+
+    subgraph "Ranked Results"
+        R["1. UltraWasher 8262 (0.952)<br/>2. EcoKettle 7200 (0.341)<br/>3. RoboCleaner 3000 (0.184)"]
+    end
+
+    QV --> D1
+    PV1 --> D1
+    QV --> D2
+    PV2 --> D2
+    QV --> D3
+    PV3 --> D3
+    D1 --> R
+    D2 --> R
+    D3 --> R
+
+    style QV fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style PV1 fill:#28A745,stroke:#1E7E34,color:#fff
+    style PV2 fill:#6C757D,stroke:#495057,color:#fff
+    style PV3 fill:#6C757D,stroke:#495057,color:#fff
+    style D1 fill:#28A745,stroke:#1E7E34,color:#fff
+    style D2 fill:#DC3545,stroke:#A71D2A,color:#fff
+    style D3 fill:#FFC107,stroke:#CC9A06,color:#000
+    style R fill:#4A90D9,stroke:#2C5F8A,color:#fff
+```
 
 | Score Range     | Meaning               | Example                                            |
 | --------------- | --------------------- | -------------------------------------------------- |
@@ -522,7 +978,41 @@ The IVFFlat index partitions vectors into 10 clusters, allowing PostgreSQL to se
 
 When the Planning Layer determines a query requires multiple domains, specialist agents are dispatched in sequence. Each runs a focused ReACT sub-loop, and outputs are synthesized.
 
-![Multi-Agent Orchestration](images/14-multi-agent-orchestration.svg)
+```mermaid
+flowchart TD
+    PLAN["Planning Layer Output:<br/>needs_multi_agent=true<br/>agents: warranty_specialist,<br/>comparison_specialist"]
+
+    subgraph "Specialist 1: warranty_specialist"
+        A1_SYS["System Prompt:<br/>Base + Focus on warranty<br/>Preferred: warranty_check"]
+        A1_LOOP["ReACT Sub-Loop<br/>(max 4 iterations)"]
+        A1_OUT["Output: Warranty details<br/>for both products"]
+    end
+
+    subgraph "Specialist 2: comparison_specialist"
+        A2_SYS["System Prompt:<br/>Base + Compare systematically<br/>Preferred: product_compare"]
+        A2_LOOP["ReACT Sub-Loop<br/>(max 4 iterations)"]
+        A2_OUT["Output: Side-by-side<br/>comparison analysis"]
+    end
+
+    SYNTH["LLM Synthesis Call<br/>Combine specialist outputs<br/>into unified response"]
+    FRAME["Response Framing<br/>Polish + confidence + sources"]
+
+    PLAN --> A1_SYS --> A1_LOOP --> A1_OUT
+    PLAN --> A2_SYS --> A2_LOOP --> A2_OUT
+    A1_OUT --> SYNTH
+    A2_OUT --> SYNTH
+    SYNTH --> FRAME
+
+    style PLAN fill:#17A2B8,stroke:#117A8B,color:#fff
+    style A1_SYS fill:#E83E8C,stroke:#B5305F,color:#fff
+    style A1_LOOP fill:#E83E8C,stroke:#B5305F,color:#fff
+    style A1_OUT fill:#E83E8C,stroke:#B5305F,color:#fff
+    style A2_SYS fill:#6F42C1,stroke:#59359A,color:#fff
+    style A2_LOOP fill:#6F42C1,stroke:#59359A,color:#fff
+    style A2_OUT fill:#6F42C1,stroke:#59359A,color:#fff
+    style SYNTH fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style FRAME fill:#20C997,stroke:#199B76,color:#fff
+```
 
 ### Agent Registry
 
@@ -540,7 +1030,57 @@ Each specialist receives a modified system prompt with their focus area and pref
 
 These are two architecturally distinct systems that serve different purposes. Understanding their difference is critical to understanding the system.
 
-![Reflection vs Reflexion](images/15-reflection-vs-reflexion.svg)
+```mermaid
+flowchart TD
+    subgraph "REFLECTION (Stage 8)"
+        direction TB
+        R_IN["Framed Response"]
+        R_EVAL["LLM Evaluate<br/>5 criteria, each 0.0 to 1.0:<br/>completeness, accuracy,<br/>relevance, clarity, actionability"]
+        R_CHECK{"overall_score<br/>at or above 0.75?"}
+        R_PASS["Pass through"]
+        R_REFINE["LLM Refine<br/>Fix identified issues"]
+        R_MAX{"Max iterations<br/>reached? (2)"}
+        R_DONE["Response finalized"]
+        R_SCOPE["Scope: This request only<br/>Nothing persists"]
+
+        R_IN --> R_EVAL --> R_CHECK
+        R_CHECK -->|"Yes"| R_PASS --> R_DONE
+        R_CHECK -->|"No"| R_REFINE --> R_MAX
+        R_MAX -->|"No"| R_EVAL
+        R_MAX -->|"Yes"| R_DONE
+    end
+
+    subgraph "REFLEXION (Stage 10)"
+        direction TB
+        X_IN["Original Score<br/>from Reflection"]
+        X_CHECK{"Score below<br/>0.7 threshold?"}
+        X_SKIP["Skip, no storage needed"]
+        X_GEN["LLM Self-Reflect<br/>Generate reusable insight:<br/>query_pattern, failure_reason,<br/>suggested_improvement, key_topics"]
+        X_STORE[("Store to TimescaleDB<br/>event_type: reflexion_insight<br/>Persists permanently")]
+        X_FUTURE["FUTURE QUERIES:<br/>Fetch matching insights<br/>Inject into ReACT prompt<br/>as 'Learnings from past'"]
+
+        X_IN --> X_CHECK
+        X_CHECK -->|"No"| X_SKIP
+        X_CHECK -->|"Yes"| X_GEN --> X_STORE
+        X_STORE -.->|"Retrieved on<br/>similar future queries"| X_FUTURE
+    end
+
+    style R_IN fill:#6610F2,stroke:#510EC0,color:#fff
+    style R_EVAL fill:#6610F2,stroke:#510EC0,color:#fff
+    style R_CHECK fill:#6610F2,stroke:#510EC0,color:#fff
+    style R_PASS fill:#28A745,stroke:#1E7E34,color:#fff
+    style R_REFINE fill:#6610F2,stroke:#510EC0,color:#fff
+    style R_MAX fill:#6610F2,stroke:#510EC0,color:#fff
+    style R_DONE fill:#28A745,stroke:#1E7E34,color:#fff
+    style R_SCOPE fill:#6C757D,stroke:#495057,color:#fff
+
+    style X_IN fill:#E65100,stroke:#BF4400,color:#fff
+    style X_CHECK fill:#E65100,stroke:#BF4400,color:#fff
+    style X_SKIP fill:#6C757D,stroke:#495057,color:#fff
+    style X_GEN fill:#E65100,stroke:#BF4400,color:#fff
+    style X_STORE fill:#E65100,stroke:#BF4400,color:#fff
+    style X_FUTURE fill:#E65100,stroke:#BF4400,color:#fff
+```
 
 ### Side-by-Side Comparison
 
@@ -564,7 +1104,32 @@ Reflection is the last chance to fix a response before the user sees it. It sits
 
 Reflection uses two distinct LLM calls, each with a different persona:
 
-![The Two LLM Roles](images/16-two-llm-roles.svg)
+```mermaid
+flowchart TD
+    subgraph "LLM Call 1: The Critic"
+        direction TB
+        C_IN["Inputs:<br/>- Original user query<br/>- Framed response text<br/>- Tools used<br/>- Number of reasoning steps<br/>- Conversation context (500 chars)"]
+        C_EVAL["Evaluator LLM<br/>temp=0.2, max_tokens=512<br/>System: 'You are a quality evaluator'"]
+        C_OUT["Output: 5 scores (0.0-1.0)<br/>+ overall_score<br/>+ issues list<br/>+ suggestions list<br/>+ needs_refinement flag"]
+    end
+
+    subgraph "LLM Call 2: The Improver"
+        direction TB
+        I_IN["Inputs:<br/>- Original user query<br/>- Current response text<br/>- Critique (score + issues)<br/>- Raw tool observations<br/>  from ReACT loop"]
+        I_REFINE["Refiner LLM<br/>temp=0.2, max_tokens=1024<br/>System: 'You are a response refiner'"]
+        I_OUT["Output:<br/>- Improved response text<br/>- Updated confidence<br/>- Updated sources"]
+    end
+
+    C_IN --> C_EVAL --> C_OUT
+    I_IN --> I_REFINE --> I_OUT
+
+    style C_IN fill:#6610F2,stroke:#510EC0,color:#fff
+    style C_EVAL fill:#6610F2,stroke:#510EC0,color:#fff
+    style C_OUT fill:#6610F2,stroke:#510EC0,color:#fff
+    style I_IN fill:#17A2B8,stroke:#117A8B,color:#fff
+    style I_REFINE fill:#17A2B8,stroke:#117A8B,color:#fff
+    style I_OUT fill:#17A2B8,stroke:#117A8B,color:#fff
+```
 
 #### The Five Quality Criteria
 
@@ -589,7 +1154,56 @@ The evaluator also returns:
 
 `_run_reflection_loop()` orchestrates the evaluate-refine cycle with four exit conditions:
 
-![Reflection Loop Control Flow](images/17-reflection-loop-control.svg)
+```mermaid
+flowchart TD
+    START(["Enter Reflection Loop"])
+
+    OBS["Compile tool observations<br/>from all ReACT steps"]
+
+    ITER{"Iteration i<br/>(max 2)"}
+
+    EVAL["LLM Evaluate<br/>Score response on 5 criteria"]
+    EMIT_EVAL["Emit: reflection_evaluating"]
+    EMIT_CRIT["Emit: reflection_critique<br/>(score, issues, suggestions)"]
+
+    CHECK_SCORE{"overall_score<br/>at or above 0.75?"}
+    EXIT_GOOD(["EXIT: Quality sufficient<br/>Use current response"])
+
+    CHECK_FLAG{"needs_refinement<br/>== true?"}
+    EXIT_FLAG(["EXIT: Evaluator says<br/>no refinement needed<br/>Use current response"])
+
+    REFINE["LLM Refine<br/>Fix identified issues using<br/>critique + tool observations"]
+    EMIT_REF["Emit: reflection_refining"]
+
+    CHECK_PARSE{"Refine returned<br/>valid JSON?"}
+    EXIT_PARSE(["EXIT: Parse failure<br/>Keep previous response"])
+
+    UPDATE["Replace current response<br/>with refined version"]
+
+    START --> OBS --> ITER
+    ITER --> EMIT_EVAL --> EVAL --> EMIT_CRIT --> CHECK_SCORE
+    CHECK_SCORE -->|"Yes"| EXIT_GOOD
+    CHECK_SCORE -->|"No"| CHECK_FLAG
+    CHECK_FLAG -->|"No"| EXIT_FLAG
+    CHECK_FLAG -->|"Yes"| EMIT_REF --> REFINE --> CHECK_PARSE
+    CHECK_PARSE -->|"No"| EXIT_PARSE
+    CHECK_PARSE -->|"Yes"| UPDATE --> ITER
+
+    style START fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style OBS fill:#6C757D,stroke:#495057,color:#fff
+    style EVAL fill:#6610F2,stroke:#510EC0,color:#fff
+    style REFINE fill:#17A2B8,stroke:#117A8B,color:#fff
+    style CHECK_SCORE fill:#FFC107,stroke:#CC9A06,color:#000
+    style CHECK_FLAG fill:#FFC107,stroke:#CC9A06,color:#000
+    style CHECK_PARSE fill:#FFC107,stroke:#CC9A06,color:#000
+    style EXIT_GOOD fill:#28A745,stroke:#1E7E34,color:#fff
+    style EXIT_FLAG fill:#28A745,stroke:#1E7E34,color:#fff
+    style EXIT_PARSE fill:#6C757D,stroke:#495057,color:#fff
+    style UPDATE fill:#17A2B8,stroke:#117A8B,color:#fff
+    style EMIT_EVAL fill:#6610F2,stroke:#510EC0,color:#fff
+    style EMIT_CRIT fill:#6610F2,stroke:#510EC0,color:#fff
+    style EMIT_REF fill:#17A2B8,stroke:#117A8B,color:#fff
+```
 
 #### Concrete Example: A Poor Response Gets Fixed
 
@@ -597,7 +1211,31 @@ Query: _"Compare the warranty of UltraWasher 8262 with RoboCleaner 3000"_
 
 The ReACT loop only checked one product and produced a partial answer. After framing, the response is: _"The UltraWasher 8262 has a 6-month warranty."_ (missing the RoboCleaner comparison entirely).
 
-![Reflection Concrete Example](images/18-reflection-example.svg)
+```mermaid
+sequenceDiagram
+    participant Loop as Reflection Loop
+    participant Critic as Evaluator LLM
+    participant Improver as Refiner LLM
+
+    Note over Loop: Iteration 1
+
+    Loop->>Critic: Evaluate: query="Compare warranty..."<br/>response="The UltraWasher 8262 has a 6-month warranty."<br/>tools=["warranty_check"]
+    Critic-->>Loop: completeness=0.3, accuracy=0.8, relevance=0.5,<br/>clarity=0.7, actionability=0.2<br/>overall_score=0.50<br/>issues=["Only one product discussed",<br/>"No RoboCleaner warranty info"]<br/>needs_refinement=true
+
+    Note over Loop: Score 0.50 < 0.75 AND needs_refinement=true
+
+    Loop->>Improver: Refine with critique + tool observations:<br/>"warranty_check: {warranty_months:6, price:121.24}"<br/>"warranty_check: {warranty_months:36, price:249.99}"
+    Improver-->>Loop: "The UltraWasher 8262 has a 6-month warranty<br/>(from Sept 2023, valid through March 2024),<br/>while the RoboCleaner 3000 offers a longer<br/>36-month warranty (from Feb 2024, valid through<br/>Feb 2027). The RoboCleaner provides 30 months<br/>more coverage."<br/>confidence=0.89
+
+    Note over Loop: Response replaced with refined version
+
+    Note over Loop: Iteration 2
+
+    Loop->>Critic: Evaluate the refined response
+    Critic-->>Loop: completeness=0.9, accuracy=0.9, relevance=0.95,<br/>clarity=0.9, actionability=0.8<br/>overall_score=0.89<br/>needs_refinement=false
+
+    Note over Loop: Score 0.89 >= 0.75 -> EXIT<br/>Refined response sent to user
+```
 
 The key mechanism: the refiner LLM receives the **raw tool observations** from the ReACT loop. Even though the ReACT answer only used UltraWasher data, the tool observations contain RoboCleaner results too — the refiner uses this data to produce the complete comparison.
 
@@ -645,7 +1283,41 @@ Reflection is the **scoring mechanism** that determines whether Reflexion fires.
 
 ### Reflexion Lifecycle — Write and Read Paths
 
-![Reflexion Lifecycle](images/19-reflexion-lifecycle.svg)
+```mermaid
+sequenceDiagram
+    participant User as User Query
+    participant React as ReACT Loop
+    participant Reflect as Reflection
+    participant Reflexion as Reflexion Engine
+    participant TSDB as TimescaleDB
+    participant Future as Future Query
+
+    Note over User,Future: WRITE PATH (current request with poor quality)
+
+    User->>React: "What warranty does ProductX have?"
+    React->>React: Tool call returns error (product not found)
+    React->>React: Gives incomplete answer
+    React->>Reflect: Framed response
+    Reflect->>Reflect: Evaluate: score = 0.55
+    Reflect->>Reflect: Refine: improved score = 0.72
+    Reflect->>Reflexion: original_score=0.55 (below 0.7)
+    Reflexion->>Reflexion: LLM Self-Reflect: generate insight
+    Note right of Reflexion: {"query_pattern": "warranty lookup",<br/>"failure_reason": "Product name was<br/>not found, needed fuzzy match",<br/>"suggested_improvement": "Try product<br/>search first to get exact name",<br/>"key_topics": ["warranty", "ProductX"]}
+    Reflexion->>TSDB: Store as reflexion_insight
+
+    Note over User,Future: READ PATH (future similar query)
+
+    Future->>React: "Check warranty for ProductY"
+    React->>TSDB: Fetch reflexion_insights (intent=warranty_question)
+    TSDB-->>React: Past insight: "Try product search first"
+    Note right of React: System prompt now includes:<br/>"Learnings from past interactions:<br/>- Try product search first to get<br/>  exact name before warranty lookup"
+    React->>React: Iteration 1: product_search("ProductY")
+    React->>React: Iteration 2: warranty_check("ProductY 5500")
+    React->>React: Complete, accurate answer
+    React->>Reflect: Evaluate: score = 0.92
+    Reflect->>Reflexion: original_score=0.92 (above 0.7)
+    Reflexion->>Reflexion: Skip storage (quality was good)
+```
 
 ### Reflexion Deep Dive — Persistent Cross-Session Learning
 
@@ -655,7 +1327,52 @@ Reflexion implements the academic Reflexion pattern (Shinn et al., 2023): an age
 
 The write path and read path are completely decoupled. They run at different times and don't depend on each other within a single request.
 
-![Reflexion Write and Read Paths](images/20-reflexion-write-read-paths.svg)
+```mermaid
+flowchart TD
+    subgraph "WRITE PATH (Stage 10 — end of request)"
+        direction TB
+        W_GATE{"original_score<br/>below 0.7?"}
+        W_SKIP["Skip storage<br/>(quality was good)"]
+        W_LLM["LLM Self-Reflect<br/>System: 'You are a<br/>self-reflection agent'<br/>temp=0.2, max_tokens=512"]
+        W_PARSE{"Valid JSON<br/>returned?"}
+        W_FAIL["Skip storage<br/>(parse failure)"]
+        W_STORE[("StoreEpisodicMemory<br/>event_type: reflexion_insight<br/>summary: the improvement text<br/>key_topics: for future matching<br/>metadata: scores + failure reason")]
+        W_EVENT["Emit: reflexion_learning"]
+
+        W_GATE -->|"No"| W_SKIP
+        W_GATE -->|"Yes"| W_LLM --> W_PARSE
+        W_PARSE -->|"No"| W_FAIL
+        W_PARSE -->|"Yes"| W_STORE --> W_EVENT
+    end
+
+    subgraph "READ PATH (before ReACT loop — start of request)"
+        direction TB
+        R_FETCH["GetEpisodicMemories<br/>customer_id, limit=5<br/>event_type=reflexion_insight"]
+        R_EMPTY{"Memories<br/>found?"}
+        R_NONE["Return empty string<br/>(no insights to inject)"]
+        R_FILTER["Filter by relevance:<br/>1. Intent match<br/>2. Topic word overlap<br/>3. Fallback: most recent"]
+        R_FORMAT["Format top 3 as:<br/>'Learnings from past interactions:<br/>- insight summary 1<br/>- insight summary 2<br/>- insight summary 3'"]
+        R_INJECT["Inject into ReACT<br/>system prompt via<br/>{reflexion_context} placeholder"]
+
+        R_FETCH --> R_EMPTY
+        R_EMPTY -->|"No"| R_NONE
+        R_EMPTY -->|"Yes"| R_FILTER --> R_FORMAT --> R_INJECT
+    end
+
+    style W_GATE fill:#E65100,stroke:#BF4400,color:#fff
+    style W_SKIP fill:#6C757D,stroke:#495057,color:#fff
+    style W_LLM fill:#E65100,stroke:#BF4400,color:#fff
+    style W_PARSE fill:#E65100,stroke:#BF4400,color:#fff
+    style W_FAIL fill:#6C757D,stroke:#495057,color:#fff
+    style W_STORE fill:#E65100,stroke:#BF4400,color:#fff
+    style W_EVENT fill:#E65100,stroke:#BF4400,color:#fff
+    style R_FETCH fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style R_EMPTY fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style R_NONE fill:#6C757D,stroke:#495057,color:#fff
+    style R_FILTER fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style R_FORMAT fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style R_INJECT fill:#4A90D9,stroke:#2C5F8A,color:#fff
+```
 
 #### Write Path — Generating and Storing Insights
 
@@ -694,7 +1411,22 @@ The LLM returns a structured insight:
 
 **Storage to TimescaleDB**: The insight is stored as an immutable episodic memory:
 
-![Insight Record in TimescaleDB](images/21-insight-record.svg)
+```mermaid
+flowchart LR
+    subgraph "Insight Record in TimescaleDB"
+        F1["event_type:<br/>reflexion_insight"]
+        F2["summary:<br/>'Always use product_search first<br/>to get exact product name, then<br/>call warranty_check with the<br/>matched name'"]
+        F3["key_topics:<br/>['warranty', 'product_search',<br/>'ProductX']"]
+        F4["resolution_status:<br/>'resolved' if refinement helped<br/>'unresolved' if it did not"]
+        F5["metadata (JSON):<br/>query_pattern, intent,<br/>failure_reason, original_score,<br/>refined_score, tools_used"]
+    end
+
+    style F1 fill:#E65100,stroke:#BF4400,color:#fff
+    style F2 fill:#28A745,stroke:#1E7E34,color:#fff
+    style F3 fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style F4 fill:#6C757D,stroke:#495057,color:#fff
+    style F5 fill:#6C757D,stroke:#495057,color:#fff
+```
 
 | Field                     | Purpose                                  | Used on Read Path?                       |
 | ------------------------- | ---------------------------------------- | ---------------------------------------- |
@@ -716,7 +1448,27 @@ The read path runs at the very start of the ReACT loop, before the first LLM cal
 
 **Relevance filtering**: Not all past insights apply to the current query. Three matching strategies are tried in order:
 
-![Relevance Filtering](images/22-relevance-filtering.svg)
+```mermaid
+flowchart TD
+    INSIGHTS["5 past insights fetched<br/>from TimescaleDB"]
+
+    M1{"Intent match?<br/>stored intent == current intent"}
+    M2{"Topic overlap?<br/>query words intersect key_topics"}
+    M3["Fallback:<br/>use most recent insights"]
+    RESULT["Top 3 relevant insights<br/>formatted for prompt injection"]
+
+    INSIGHTS --> M1
+    M1 -->|"Matched"| RESULT
+    M1 -->|"No match"| M2
+    M2 -->|"Matched"| RESULT
+    M2 -->|"No match"| M3 --> RESULT
+
+    style INSIGHTS fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style M1 fill:#28A745,stroke:#1E7E34,color:#fff
+    style M2 fill:#FFC107,stroke:#CC9A06,color:#000
+    style M3 fill:#6C757D,stroke:#495057,color:#fff
+    style RESULT fill:#4A90D9,stroke:#2C5F8A,color:#fff
+```
 
 | Strategy          | How It Works                                                  | Example                                                                                           |
 | ----------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
@@ -740,7 +1492,56 @@ The LLM sees these learnings before its first Thought. They influence tool selec
 
 The following traces Reflexion across two sessions — the first where the agent fails and stores a learning, and the second where it retrieves and applies that learning.
 
-![Multi-Session Reflexion Example](images/23-multi-session-example.svg)
+```mermaid
+sequenceDiagram
+    participant User1 as Session 1 (Tuesday)
+    participant React1 as ReACT Loop
+    participant Reflect1 as Reflection
+    participant Reflexion1 as Reflexion Engine
+    participant TSDB as TimescaleDB
+    participant User2 as Session 2 (Wednesday)
+    participant React2 as ReACT Loop
+
+    Note over User1,React1: Session 1: Agent fails on warranty lookup
+
+    User1->>React1: "What warranty does ProductX have?"
+    React1->>React1: Thought: Check warranty directly
+    React1->>React1: Action: warranty_check({"product_name":"ProductX"})
+    React1->>React1: Observation: {"results":[],"count":0}
+    Note right of React1: ProductX not found!<br/>Exact name is "ProductX 5500"
+    React1->>React1: Answer: "I couldn't find warranty info for ProductX"
+
+    React1->>Reflect1: Framed response
+    Reflect1->>Reflect1: Evaluate: score = 0.45
+    Reflect1->>Reflect1: Refine: improved text, score = 0.72
+
+    Note over Reflect1,Reflexion1: original_score 0.45 < 0.7 threshold
+
+    Reflect1->>Reflexion1: original_score=0.45, issues, evaluation
+    Reflexion1->>Reflexion1: LLM Self-Reflect: analyze failure
+    Note right of Reflexion1: Insight generated:<br/>"Always use product_search first<br/>to resolve the exact product name"
+    Reflexion1->>TSDB: Store reflexion_insight
+    Note right of TSDB: summary: "Always use product_search<br/>first to resolve exact name"<br/>key_topics: ["warranty","ProductX"]<br/>intent: "warranty_question"
+
+    Note over User2,React2: Session 2 (next day): Similar query
+
+    User2->>React2: "Check warranty for ProductY"
+    React2->>TSDB: GetEpisodicMemories(event_type=reflexion_insight)
+    TSDB-->>React2: 1 insight matched (intent=warranty_question)
+
+    Note right of React2: System prompt now includes:<br/>"Learnings from past interactions:<br/>- Always use product_search first<br/>  to resolve exact product name"
+
+    React2->>React2: Thought: Based on past learnings, I should<br/>search for the exact name first
+    React2->>React2: Action: product_search({"query":"ProductY"})
+    React2->>React2: Observation: {"results":[{"product_name":"ProductY 7200"}]}
+    React2->>React2: Thought: Found exact name. Now check warranty.
+    React2->>React2: Action: warranty_check({"product_name":"ProductY 7200"})
+    React2->>React2: Observation: {"results":[{"warranty_months":24}]}
+    React2->>React2: Answer: "ProductY 7200 has a 24-month warranty..."
+
+    React2->>Reflect1: Evaluate: score = 0.91
+    Note over Reflect1,Reflexion1: 0.91 >= 0.7 -> skip storage<br/>Nothing to learn this time
+```
 
 The agent made a fundamentally different decision in Session 2. Without the reflexion insight, the LLM would likely call `warranty_check("ProductY")` directly — the same pattern that failed in Session 1. With the insight injected into its prompt, it called `product_search` first to resolve the exact product name.
 
@@ -774,13 +1575,61 @@ The recommendation service generates contextual suggestions at two points: sessi
 
 ### 3-Tier Cold Start Strategy
 
-![3-Tier Cold Start Strategy](images/24-cold-start-strategy.svg)
+```mermaid
+flowchart TD
+    START(["GetStartRecommendations"])
+
+    T1{"Tier 1:<br/>Returning user?<br/>Has episodic memories?"}
+    T1_YES["Build Customer Profile<br/>Gap analysis vs empty session<br/>Personalized suggestions:<br/>1. Continue from last topic<br/>2. Unexplored brand + price range<br/>3. Missing intent with real data"]
+
+    T2{"Tier 2:<br/>System has data?<br/>Other users' conversations?"}
+    T2_YES["Cross-User Popular Queries<br/>Aggregated from conversation_turns<br/>Top 5 by frequency"]
+
+    T3["Tier 3: Catalog-Aware Defaults<br/>Real brand names from products table<br/>Real price ranges from catalog"]
+
+    OUT(["Return up to 5 suggestions"])
+
+    START --> T1
+    T1 -->|"Yes"| T1_YES --> OUT
+    T1 -->|"No"| T2
+    T2 -->|"Yes"| T2_YES --> OUT
+    T2 -->|"No"| T3 --> OUT
+
+    style START fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    style T1 fill:#28A745,stroke:#1E7E34,color:#fff
+    style T1_YES fill:#28A745,stroke:#1E7E34,color:#fff
+    style T2 fill:#FFC107,stroke:#CC9A06,color:#000
+    style T2_YES fill:#FFC107,stroke:#CC9A06,color:#000
+    style T3 fill:#6C757D,stroke:#495057,color:#fff
+    style OUT fill:#4A90D9,stroke:#2C5F8A,color:#fff
+```
 
 ### Follow-Up Recommendation Pipeline
 
 After every response, the system generates exactly 3 product-focused follow-up suggestions:
 
-![Follow-Up Recommendation Pipeline](images/25-follow-up-pipeline.svg)
+```mermaid
+flowchart LR
+    A["Build Session Context<br/>intents, products, brands,<br/>tools from conversation_turns"] --> B["Build Customer Profile<br/>from episodic memories"]
+    B --> C["Gap Analysis<br/>what user HAS done<br/>vs what they COULD do"]
+    C --> D["Select Template Set<br/>keyed by (intent, gap_type)"]
+    D --> E["Fill Templates<br/>with real product data"]
+    E --> F["Deduplicate<br/>+ exclude last query echo"]
+    F --> G{"3 suggestions?"}
+    G -->|"No"| H["Gap-based fallbacks<br/>then catalog generics"]
+    H --> G
+    G -->|"Yes"| I(["Return 3 suggestions"])
+
+    style A fill:#50C878,stroke:#3A9A5C,color:#fff
+    style B fill:#FF6B6B,stroke:#CC5555,color:#fff
+    style C fill:#E65100,stroke:#BF4400,color:#fff
+    style D fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style E fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style F fill:#6C757D,stroke:#495057,color:#fff
+    style G fill:#FFC107,stroke:#CC9A06,color:#000
+    style H fill:#6C757D,stroke:#495057,color:#fff
+    style I fill:#4A90D9,stroke:#2C5F8A,color:#fff
+```
 
 #### Gap Analysis Dimensions
 
@@ -798,7 +1647,33 @@ After every response, the system generates exactly 3 product-focused follow-up s
 
 Memory is organized into five layers across three storage engines. The Memory Service provides a unified gRPC interface, routing reads and writes to the appropriate backend.
 
-![Memory Layers](images/26-memory-layers.svg)
+```mermaid
+graph LR
+    subgraph "Hot Path (Redis)"
+        ST["Short-Term Memory<br/>Current session turns<br/>TTL: 30min sliding"]
+    end
+
+    subgraph "Immutable Path (TimescaleDB)"
+        EP["Episodic Memory<br/>Session summaries<br/>Reflexion insights<br/>Evaluation records<br/>Hypertable, append-only"]
+        AT["Audit Trail<br/>Every session event<br/>Hypertable, append-only"]
+    end
+
+    subgraph "Relational Path (PostgreSQL + pgvector)"
+        SM["Semantic Memory<br/>Product embeddings<br/>pgvector index"]
+        PR["Procedural Memory<br/>Tool definitions<br/>and usage patterns"]
+        DM["Domain Memory<br/>Product catalog<br/>and metadata"]
+    end
+
+    ST -->|"session ends"| EP
+    ST -->|"every event"| AT
+
+    style ST fill:#DC382D,stroke:#A82B23,color:#fff
+    style EP fill:#E65100,stroke:#BF4400,color:#fff
+    style AT fill:#E65100,stroke:#BF4400,color:#fff
+    style SM fill:#336791,stroke:#264E6D,color:#fff
+    style PR fill:#336791,stroke:#264E6D,color:#fff
+    style DM fill:#336791,stroke:#264E6D,color:#fff
+```
 
 | Layer | Storage | Purpose |
 |-------|---------|---------|
@@ -810,7 +1685,36 @@ Memory is organized into five layers across three storage engines. The Memory Se
 
 ### Storage Schema
 
-![Storage Schema](images/27-storage-schema.svg)
+```mermaid
+flowchart TD
+    subgraph "PostgreSQL (Relational, Durable)"
+        PG_SESSIONS["sessions<br/>id, customer_id (FK),<br/>metadata (JSONB),<br/>created_at, last_active_at"]
+        PG_TURNS["conversation_turns<br/>id, session_id (FK), role,<br/>content, intent, confidence,<br/>tool_calls (JSONB), created_at"]
+        PG_PRODUCTS["products<br/>id, product_name, description,<br/>price, manufacturing_date,<br/>warranty_months, created_at"]
+        PG_TOOLS["tool_definitions<br/>id, name, description,<br/>parameter_schema (JSON),<br/>is_active"]
+        PG_CUSTOMERS["customers<br/>id, name, email,<br/>password_hash, created_at"]
+    end
+
+    subgraph "TimescaleDB (Time-Series, Immutable)"
+        TS_EPISODIC["episodic_memories<br/>id, customer_id, session_id,<br/>event_type, summary,<br/>key_topics (TEXT[]),<br/>resolution_status,<br/>metadata (JSONB), created_at"]
+        TS_AUDIT["session_audit_trail<br/>id, session_id, customer_id,<br/>event_type, event_data (JSONB),<br/>event_time"]
+    end
+
+    subgraph "Redis (Cache, Volatile)"
+        RD_SESSION["Session Cache<br/>TTL: 1800s<br/>Key: session:{id}"]
+        RD_HISTORY["Conversation Cache<br/>List per session<br/>Key: history:{session_id}"]
+    end
+
+    style PG_SESSIONS fill:#336791,stroke:#264E6D,color:#fff
+    style PG_TURNS fill:#336791,stroke:#264E6D,color:#fff
+    style PG_PRODUCTS fill:#336791,stroke:#264E6D,color:#fff
+    style PG_TOOLS fill:#336791,stroke:#264E6D,color:#fff
+    style PG_CUSTOMERS fill:#336791,stroke:#264E6D,color:#fff
+    style TS_EPISODIC fill:#E65100,stroke:#BF4400,color:#fff
+    style TS_AUDIT fill:#E65100,stroke:#BF4400,color:#fff
+    style RD_SESSION fill:#DC382D,stroke:#A82B23,color:#fff
+    style RD_HISTORY fill:#DC382D,stroke:#A82B23,color:#fff
+```
 
 ### Storage Role per Feature
 
@@ -828,11 +1732,126 @@ Memory is organized into five layers across three storage engines. The Memory Se
 
 #### PostgreSQL (Relational + pgvector)
 
-![PostgreSQL ER Diagram](images/28-postgresql-er-diagram.svg)
+```mermaid
+erDiagram
+    USERS {
+        uuid id PK
+        varchar email UK
+        varchar password_hash
+        varchar display_name
+        boolean is_active
+        timestamp created_at
+        timestamp last_login_at
+    }
+
+    PRODUCTS {
+        uuid id PK
+        varchar product_name
+        text description
+        decimal price
+        date manufacturing_date
+        int warranty_months
+        timestamp created_at
+    }
+
+    PRODUCT_EMBEDDINGS {
+        uuid id PK
+        uuid product_id FK
+        vector embedding
+        timestamp created_at
+    }
+
+    SESSIONS {
+        uuid id PK
+        uuid customer_id FK
+        jsonb metadata
+        timestamp created_at
+        timestamp last_active_at
+    }
+
+    CONVERSATION_TURNS {
+        uuid id PK
+        uuid session_id FK
+        varchar role
+        text content
+        varchar intent
+        float confidence
+        jsonb tool_calls
+        timestamp created_at
+    }
+
+    QUERY_PATTERNS {
+        uuid id PK
+        text query_text
+        varchar intent
+        int frequency
+        timestamp last_seen
+    }
+
+    TOOL_DEFINITIONS {
+        uuid id PK
+        varchar name UK
+        text description
+        jsonb parameter_schema
+        boolean is_active
+        timestamp created_at
+    }
+
+    TOOL_EXECUTION_LOGS {
+        uuid id PK
+        uuid session_id FK
+        uuid tool_id FK
+        jsonb input_params
+        jsonb output_result
+        int execution_time_ms
+        varchar status
+        timestamp created_at
+    }
+
+    USERS ||--o{ SESSIONS : has
+    PRODUCTS ||--o{ PRODUCT_EMBEDDINGS : has
+    SESSIONS ||--o{ CONVERSATION_TURNS : contains
+    SESSIONS ||--o{ TOOL_EXECUTION_LOGS : logs
+    TOOL_DEFINITIONS ||--o{ TOOL_EXECUTION_LOGS : executed_by
+```
 
 #### TimescaleDB (Immutable Hypertables)
 
-![TimescaleDB ER Diagram](images/29-timescaledb-er-diagram.svg)
+```mermaid
+erDiagram
+    EPISODIC_MEMORIES {
+        uuid id PK
+        varchar customer_id
+        uuid session_id
+        varchar event_type
+        text summary
+        text_arr key_topics
+        varchar resolution_status
+        jsonb metadata
+        timestamptz created_at PK
+    }
+
+    SESSION_AUDIT_TRAIL {
+        uuid id PK
+        uuid session_id
+        varchar customer_id
+        varchar event_type
+        jsonb event_data
+        timestamptz event_time PK
+    }
+
+    DAILY_SESSION_STATS {
+        timestamptz day
+        varchar customer_id
+        int sessions_started
+        int user_messages
+        int tool_executions
+        int clarifications
+        int errors
+    }
+
+    SESSION_AUDIT_TRAIL }|--|| DAILY_SESSION_STATS : aggregates
+```
 
 Both TimescaleDB tables are **append-only** — UPDATE and DELETE are blocked by database triggers. `episodic_memories` uses 7-day chunks; `session_audit_trail` uses 1-day chunks with a 90-day retention policy. `daily_session_stats` is a continuous aggregate materialised view, auto-refreshed hourly.
 
@@ -844,7 +1863,105 @@ Both TimescaleDB tables are **append-only** — UPDATE and DELETE are blocked by
 
 This walkthrough traces every stage, event, and service call for a real query.
 
-![End-to-End Query Walkthrough](images/30-end-to-end-walkthrough.svg)
+```mermaid
+sequenceDiagram
+    actor User
+    participant GW as Gateway
+    participant AS as Agent Service
+    participant LLM as LLM Service
+    participant MS as Memory Service
+    participant TS as Tool Service
+    participant RS as Recommendation Svc
+    participant DB as PostgreSQL
+    participant TSDB as TimescaleDB
+
+    User->>GW: WebSocket: {"type":"user_message", "query":"Compare the warranty..."}
+    GW->>GW: JWT validation + rate limit check
+    GW->>AS: gRPC ProcessQuery(session_id, customer_id, query)
+
+    Note over AS: Stage 0: Session Context
+    AS->>MS: TouchSession(session_id)
+    MS->>DB: UPDATE sessions SET last_active_at
+    AS->>MS: GetConversationHistory(session_id, limit=10)
+    MS-->>AS: Last 10 turns
+    AS->>MS: AddConversationTurn(role=user, content=query)
+
+    Note over AS: Stage 1: Input Guardrails
+    AS->>AS: Regex checks: length OK, no injection, no PII
+
+    Note over AS: Stage 2: Intent Classification
+    AS->>LLM: GenerateAnswer(INTENT_PROMPT, temp=0.1)
+    LLM-->>AS: {"intent":"comparison","confidence":0.94}
+
+    Note over AS: Stage 3: Clarification
+    AS->>AS: confidence 0.94 >= 0.8, skip clarification
+
+    Note over AS: Stage 4: Planning
+    AS->>TS: ListTools()
+    TS-->>AS: [product_search, price_lookup, warranty_check, product_compare]
+    AS->>LLM: GenerateAnswer(PLANNING_PROMPT, temp=0.2)
+    LLM-->>AS: needs_multi_agent=false, steps=[warranty x2, compare]
+    AS-->>GW: Event: agent_planning
+
+    Note over AS: Stage 5: ReACT Loop (Single Agent)
+    AS->>TSDB: GetEpisodicMemories(event_type=reflexion_insight)
+    TSDB-->>AS: 1 past insight: "Check both products before answering"
+    AS->>AS: Inject insight + plan into system prompt
+
+    rect rgb(30, 60, 100)
+        Note over AS,TS: ReACT Iteration 1
+        AS->>LLM: ReACT step (temp=0.3)
+        LLM-->>AS: Thought: Need UltraWasher warranty. Action: warranty_check({"product_name":"UltraWasher 8262"})
+        AS->>AS: Validate params: OK
+        AS->>TS: ExecuteTool(warranty_check, params)
+        TS->>DB: SELECT warranty_months, manufacturing_date FROM products
+        TS-->>AS: {"warranty_months":24,"manufacturing_date":"2024-01-15"}
+        AS->>AS: Validate result: OK
+        AS-->>GW: Event: agent_thinking (iteration 1)
+    end
+
+    rect rgb(30, 60, 100)
+        Note over AS,TS: ReACT Iteration 2
+        AS->>LLM: ReACT step with history
+        LLM-->>AS: Thought: Now check RoboCleaner. Action: warranty_check({"product_name":"RoboCleaner 3000"})
+        AS->>TS: ExecuteTool(warranty_check, params)
+        TS-->>AS: {"warranty_months":36,"manufacturing_date":"2024-02-10"}
+        AS-->>GW: Event: agent_thinking (iteration 2)
+    end
+
+    rect rgb(30, 60, 100)
+        Note over AS,TS: ReACT Iteration 3
+        AS->>LLM: ReACT step with history
+        LLM-->>AS: Thought: I have both warranties. Answer: RoboCleaner 3000 has 36 months vs UltraWasher 8262's 24 months...
+        AS-->>GW: Event: agent_thinking (iteration 3)
+    end
+
+    Note over AS: Stage 7: Response Framing
+    AS->>LLM: GenerateAnswer(FRAMING_PROMPT, temp=0.2)
+    LLM-->>AS: {"text":"polished response","confidence":0.91,"sources":["UltraWasher 8262","RoboCleaner 3000"]}
+
+    Note over AS: Stage 8: Reflection
+    AS->>LLM: GenerateAnswer(EVALUATE_PROMPT, temp=0.2)
+    LLM-->>AS: {"overall_score":0.88,"needs_refinement":false}
+    AS-->>GW: Event: reflection_evaluating
+    AS-->>GW: Event: reflection_critique (score=0.88)
+
+    Note over AS: Stage 9: Output Guardrails
+    AS->>AS: PII scan: clean
+
+    Note over AS: Stage 10: Reflexion
+    AS->>AS: original_score 0.88 >= 0.7, skip insight storage
+
+    Note over AS: Stage 11: Evaluation Storage
+    AS->>TSDB: StoreEpisodicMemory(event_type=evaluation_record)
+
+    Note over AS: Stage 12: Recommendations + Streaming
+    AS->>RS: GetFollowUpRecommendations(session_id, intent, customer_id)
+    RS-->>AS: ["What's the price of RoboCleaner 3000?","Explore EcoKettle products","Which product has the longest warranty?"]
+    AS-->>GW: Event: token (streamed response text)
+    AS-->>GW: Event: response_complete (response + recommendations)
+    GW-->>User: WebSocket: streamed tokens + final payload
+```
 
 ### What the User Sees in the UI
 
@@ -900,7 +2017,50 @@ If the same query produced a poor response (e.g., the agent only checked one pro
 
 ### Container Topology
 
-![Container Topology](images/31-container-topology.svg)
+```mermaid
+graph TB
+    subgraph Docker Compose
+        subgraph Infrastructure
+            REDIS["Redis 7<br/>:6379"]
+            PG["PostgreSQL 16<br/>+ pgvector<br/>:5432"]
+            TS["TimescaleDB<br/>:5433<br/>Immutable Store"]
+        end
+
+        subgraph Application Services
+            GW["Gateway Service<br/>:8000<br/>FastAPI + WS"]
+            AG["Agent Service<br/>:50054<br/>gRPC"]
+            MEM["Memory Service<br/>:50055<br/>gRPC"]
+            LLM_S["LLM Service<br/>:50053<br/>gRPC"]
+            KN["Knowledge Service<br/>:50052<br/>gRPC"]
+            TOOL_S["Tool Service<br/>:50056<br/>gRPC"]
+            REC["Recommendation Service<br/>:50057<br/>gRPC"]
+        end
+    end
+
+    GW --> AG
+    AG --> MEM
+    AG --> LLM_S
+    AG --> KN
+    AG --> TOOL_S
+    AG --> REC
+    MEM --> REDIS
+    MEM --> PG
+    MEM --> TS
+    KN --> PG
+    TOOL_S --> PG
+    REC --> PG
+
+    style GW fill:#F5A623,stroke:#C47D0E,color:#fff
+    style AG fill:#D0021B,stroke:#9B0016,color:#fff
+    style MEM fill:#FF6B6B,stroke:#CC5555,color:#fff
+    style LLM_S fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style KN fill:#7B68EE,stroke:#5A4ACB,color:#fff
+    style TOOL_S fill:#50C878,stroke:#3A9A5C,color:#fff
+    style REC fill:#50C878,stroke:#3A9A5C,color:#fff
+    style REDIS fill:#DC382D,stroke:#A82B23,color:#fff
+    style PG fill:#336791,stroke:#264E6D,color:#fff
+    style TS fill:#336791,stroke:#264E6D,color:#fff
+```
 
 ### Service Dependencies
 
@@ -923,7 +2083,24 @@ If the same query produced a poor response (e.g., the agent only checked one pro
 
 ### Authentication Flow
 
-![Authentication Flow](images/32-authentication-flow.svg)
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant GW as Gateway
+    participant PG as PostgreSQL
+
+    B->>GW: POST /api/login {email, password}
+    GW->>PG: SELECT user WHERE email = ?
+    PG-->>GW: user row (id, password_hash, ...)
+    GW->>GW: bcrypt.verify(password, hash)
+    GW-->>B: {token: "eyJ...", user: {...}}
+
+    B->>GW: WebSocket /ws/chat
+    B->>GW: {type: "session_start", token: "eyJ..."}
+    GW->>GW: JWT.verify(token)
+    GW->>GW: Extract user_id from claims
+    GW-->>B: {type: "session_ready", session_id: "..."}
+```
 
 ### JWT Token
 
@@ -942,7 +2119,46 @@ If the same query produced a poor response (e.g., the agent only checked one pro
 
 All inter-service gRPC communication uses TLS with a self-signed CA for Docker local development.
 
-![TLS Topology](images/33-tls-topology.svg)
+```mermaid
+graph TB
+    subgraph "TLS Certificate Chain"
+        CA["Self-Signed CA<br/>ca.pem / ca-key.pem"]
+        SC["Server Certificate<br/>server.pem / server-key.pem<br/>SANs: all service hostnames"]
+    end
+
+    CA -->|"signs"| SC
+
+    subgraph "gRPC Services (TLS Server)"
+        AG["Agent :50054"]
+        MEM_S["Memory :50055"]
+        LLM_S2["LLM :50053"]
+        KN_S["Knowledge :50052"]
+        TOOL_S2["Tool :50056"]
+        REC_S["Recommendation :50057"]
+    end
+
+    subgraph "gRPC Clients (TLS Channel)"
+        GW_C["Gateway"]
+        AG_C["Agent"]
+        TOOL_C["Tool"]
+        REC_C["Recommendation"]
+    end
+
+    SC -->|"loaded by"| AG
+    SC -->|"loaded by"| MEM_S
+    SC -->|"loaded by"| LLM_S2
+    SC -->|"loaded by"| KN_S
+    SC -->|"loaded by"| TOOL_S2
+    SC -->|"loaded by"| REC_S
+
+    CA -->|"trusted by"| GW_C
+    CA -->|"trusted by"| AG_C
+    CA -->|"trusted by"| TOOL_C
+    CA -->|"trusted by"| REC_C
+
+    style CA fill:#DC3545,stroke:#A71D2A,color:#fff
+    style SC fill:#FFC107,stroke:#CC9A06,color:#000
+```
 
 Certificate generation: `python scripts/generate_certs.py` creates `certs/` with CA + server certificates. SANs include all Docker service hostnames.
 
