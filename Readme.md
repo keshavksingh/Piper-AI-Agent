@@ -8,7 +8,7 @@
 
 1. [High-Level System Overview](#1-high-level-system-overview)
 2. [Service Topology](#2-service-topology)
-3. [The 12-Stage Query Pipeline](#3-the-12-stage-query-pipeline)
+3. [The 15-Stage Query Pipeline](#3-the-15-stage-query-pipeline)
 4. [Detailed Stage Walkthrough](#4-detailed-stage-walkthrough)
 5. [ReACT Reasoning Engine](#5-react-reasoning-engine)
 6. [Semantic Search — How Products Are Found](#6-semantic-search--how-products-are-found)
@@ -58,7 +58,7 @@ Each service runs as an independent gRPC server. All inter-service communication
 | Service                    | Address             | Role                                                      |
 | -------------------------- | ------------------- | --------------------------------------------------------- |
 | **Gateway Server**         | `:8765` (WebSocket) | Client-facing entry point, JWT auth, rate limiting        |
-| **Agent Service**          | `:50054` (gRPC)     | Core orchestrator — 12-stage pipeline, ReACT, multi-agent |
+| **Agent Service**          | `:50054` (gRPC)     | Core orchestrator — 15-stage pipeline, ReACT, multi-agent |
 | **Memory Service**         | `:50055` (gRPC)     | Session state, conversation history, episodic memories    |
 | **Tool Service**           | `:50056` (gRPC)     | Domain tool execution with schema validation              |
 | **LLM Service**            | `:50053` (gRPC)     | Claude API wrapper with temperature/token routing         |
@@ -71,24 +71,30 @@ Each service runs as an independent gRPC server. All inter-service communication
 
 ---
 
-## 3. The 12-Stage Query Pipeline
+## 3. The 15-Stage Query Pipeline
 
-Every user query flows through a deterministic 12-stage pipeline inside `ProcessQuery()`. Each stage is independently feature-flagged.
+Every user query flows through a deterministic 15-stage pipeline inside `ProcessQuery()`. Each stage is independently feature-flagged.
 
-![12-Stage Query Pipeline](images/04-twelve-stage-pipeline.svg)
+![15-Stage Query Pipeline](images/04-twelve-stage-pipeline.svg)
 
 ---
 
 ## 4. Detailed Stage Walkthrough
 
-### Stage 0 — Session Context
+### Stage 0 — Session Context & Structured Memory
 
 ```
 Session Touch (Redis TTL refresh)
     +-- Load last 10 conversation turns from PostgreSQL
-    +-- Build memory_context string: "User: ... \n Assistant: ..."
+    +-- Build structured memory_context with 3 sections:
+    |     1. Conversation Flow (numbered exchange summaries)
+    |     2. Active Context (products mentioned, intents seen, tools called)
+    |     3. Latest Exchange (full detail for current topic)
+    +-- Extract previous turn's intent + tool_calls for follow-up detection
     +-- Store current user query as new conversation turn
 ```
+
+The structured memory context replaces the flat "User: ... / Assistant: ..." dump used previously. Older assistant responses are truncated to `MEMORY_CONTEXT_TRUNCATE_LENGTH` (default 200 chars); the latest exchange is preserved in full. Products are detected by matching against a known catalog product list (`_CATALOG_PRODUCTS`).
 
 ### Stage 1 — Input Guardrails
 
@@ -111,40 +117,67 @@ Three regex-based checks run on every input. No LLM calls are made — this is p
 
 **Implementation**: `_check_input_guardrails(query)` returns `(is_safe, sanitized_query, issues)`. When blocked, `ProcessQuery()` yields a `guardrail_blocked` event and returns immediately — no further processing occurs.
 
-### Stage 2 — Intent Classification
+### Stage 2 — Query Rewriting (Pronoun Resolution)
 
-The LLM classifies the user's query into one of 7 intent categories:
+An LLM call rewrites the user's query to be fully self-contained by resolving pronouns, demonstratives, and ellipsis using conversation history.
 
-| Intent              | Description                      | Routing               |
-| ------------------- | -------------------------------- | --------------------- |
-| `product_inquiry`   | Questions about product details  | ReACT or Multi-Agent  |
-| `price_check`       | Price lookups and budget queries | ReACT or Multi-Agent  |
-| `comparison`        | Comparing products/brands        | ReACT or Multi-Agent  |
-| `warranty_question` | Warranty coverage and claims     | ReACT or Multi-Agent  |
-| `follow_up`         | Continuing previous conversation | ReACT or Multi-Agent  |
-| `general_question`  | General chat, greetings          | Direct LLM (no tools) |
-| `out_of_scope`      | Off-topic queries                | Polite redirect       |
+| Input                                    | Rewritten Output                               |
+| ---------------------------------------- | ---------------------------------------------- |
+| "How much does it cost?"                 | "How much does the RoboCleaner 3120 cost?"     |
+| "What about the cheaper one?"            | "What about the EcoKettle 1042?"               |
+| "Compare them"                           | "Compare the UltraWasher 8262 and PowerDrill 5641" |
+| "Tell me more"                           | "Tell me more about the RoboCleaner 3120"      |
 
-### Stage 3 — Clarification Gate
+**Guard rails on the rewrite:** Rewrites are rejected (falling back to the original query) if the result is empty, if it exceeds 5x the original query length (with a floor of 200 chars), or if the LLM call fails for any reason.
 
-If intent `confidence < 0.8` and `needs_clarification = true`, the system sends a structured clarification request with clickable options:
+**Feature flag:** `QUERY_REWRITE_ENABLED` (default `true`). Only runs when conversation history exists (first query in a session is never rewritten).
 
-```json
-{
-  "type": "clarification",
-  "message": "I want to make sure I help you correctly. Could you clarify:",
-  "options": [
-    {"label": "I'm looking for product recommendations", "value": "product_inquiry"},
-    {"label": "I want to compare prices", "value": "price_check"},
-    {"label": "I have a warranty question", "value": "warranty_question"}
-  ],
-  "allow_freetext": true
-}
-```
+**Implementation:** `_rewrite_query(query, history_turns)` uses `QUERY_REWRITE_PROMPT` with `temp=0.1, max_tokens=128`.
 
-The user's response is merged with the original query and re-classified (loops back to Stage 2).
+### Stage 3 — Intent Classification
 
-### Stage 4 — Planning Layer
+The LLM classifies the user's query into one of 9 intent categories, now with **domain relevance scoring** and **previous turn awareness**:
+
+| Intent              | Description                          | Routing                     |
+| ------------------- | ------------------------------------ | --------------------------- |
+| `product_inquiry`   | Questions about product details      | ReACT or Multi-Agent        |
+| `price_check`       | Price lookups and budget queries     | ReACT or Multi-Agent        |
+| `comparison`        | Comparing products/brands            | ReACT or Multi-Agent        |
+| `warranty_question` | Warranty coverage and claims         | ReACT or Multi-Agent        |
+| `follow_up`         | Continuing previous conversation     | ReACT or Multi-Agent        |
+| `session_query`     | Meta-queries about the conversation  | Direct history lookup       |
+| `general_question`  | General chat, greetings              | Direct LLM (no tools)       |
+| `out_of_scope`      | Off-topic queries                    | Catalog-aware redirect      |
+
+**New fields in classification output:**
+
+- `domain_relevance` (0.0-1.0): How related the query is to the product catalog. HIGH (0.7-1.0) for product topics, LOW (0.0-0.3) for unrelated topics.
+- `previous_intent` and `previous_entities`: Injected into the prompt so the LLM can detect follow-ups and continuations.
+
+**Follow-up detection:** When the previous turn was product-related and the current query references or continues that discussion (e.g., "Tell me more", "What about the warranty?"), the classifier assigns `follow_up` with high confidence and high domain relevance.
+
+### Stage 4 — Decision Routing
+
+After classification, the pipeline routes the query through one of four paths:
+
+**Path 0 — Session Query:** If `intent == "session_query"`, the system answers directly from conversation history without any LLM or tool calls. Extracts all user queries from `history_turns`, formats them as a numbered list, applies output guardrails, and streams the response.
+
+**Path A — Domain Relevance Redirect:** If `domain_relevance < DOMAIN_RELEVANCE_THRESHOLD` (default 0.5), the system responds with a catalog-aware redirect message listing all product categories and capabilities. No ReACT loop is executed.
+
+**Path B — Dynamic Clarification Gate:** If `needs_clarification = true`, `confidence < INTENT_CONFIDENCE_THRESHOLD`, and `intent != "follow_up"`, the system sends a structured clarification request. Clarification options are now **context-aware** based on entity keywords:
+
+| Detected Category | Keywords                                        | Options Offered                          |
+| ----------------- | ----------------------------------------------- | ---------------------------------------- |
+| Cleaning          | clean, vacuum, wash, mop, floor, dust           | RoboCleaner, SuperVac, UltraWasher       |
+| Kitchen           | blend, cook, kitchen, kettle, boil, smoothie    | MegaBlender, EcoKettle                   |
+| Smart Home        | smart, lamp, light, air, noise, purif           | SmartLamp, AirPurifier, NoiseCanceller   |
+| *(fallback)*      | No category match                               | Generic intent-based options             |
+
+The clarification turn is stored to memory before yielding (ensuring conversation history stays complete). The user's response can include enriched product context (e.g., selecting "RoboCleaner" appends `-- I'm looking for product recommendations about RoboCleaner` to the original query).
+
+**Path C — Normal Processing:** High domain relevance + high confidence. Proceeds to Planning (Stage 5).
+
+### Stage 5 — Planning Layer
 
 The LLM decomposes the query into executable sub-goals:
 
@@ -170,7 +203,7 @@ The LLM decomposes the query into executable sub-goals:
 
 This plan is injected into the ReACT system prompt as an execution guide, and determines whether single-agent or multi-agent orchestration is used.
 
-### Stage 9 — Output Guardrails (PII Redaction)
+### Stage 10 — Output Guardrails (PII Redaction)
 
 The same PII regex patterns from Stage 1 are applied to the response text. Unlike input guardrails, output guardrails **redact** rather than block:
 
@@ -183,7 +216,7 @@ The same PII regex patterns from Stage 1 are applied to the response text. Unlik
 
 `_check_output_guardrails(response_text)` returns `(sanitized_text, was_modified, redactions)`. If PII is redacted, a `guardrail_sanitized` event is emitted.
 
-### Stage 11 — Evaluation Storage
+### Stage 12 — Evaluation Storage
 
 Every request stores a structured evaluation record to TimescaleDB as an episodic memory with `event_type = 'evaluation_record'`:
 
@@ -225,6 +258,8 @@ ORDER BY created_at DESC;
 | Component | Extra LLM Calls | Approximate Overhead |
 |---|---|---|
 | Input guardrails (regex) | 0 | <1ms |
+| Query rewriting (pronoun resolution) | +1 | ~0.5-1s |
+| Intent classification (with domain relevance) | +1 | ~1-2s |
 | Planning | +1 | ~1-2s |
 | Multi-agent (2 specialists + synthesis) | +3-5 | ~5-10s |
 | Reflection: passes (score >= 0.75) | +1 | ~1-2s |
@@ -234,7 +269,7 @@ ORDER BY created_at DESC;
 | Output guardrails (regex) | 0 | <1ms |
 | Evaluation storage (DB write) | 0 | ~50ms |
 
-Worst case (planning + multi-agent + 2 reflection refinements + reflexion): ~15-20s additional. Well within the 120s timeout.
+Worst case (query rewrite + planning + multi-agent + 2 reflection refinements + reflexion): ~16-22s additional. Well within the 120s timeout.
 
 ### Pipeline Methods Reference
 
@@ -243,28 +278,32 @@ All methods on `AgentServiceServicer` in `agent_service/server.py`:
 | Method | Stage | Purpose |
 |---|---|---|
 | `ProcessQuery()` | -- | Main entry point; orchestrates all stages |
+| `build_memory_context(turns)` | 0 | Build structured 3-section context from conversation turns |
 | `_check_input_guardrails(query)` | 1 | Regex PII + injection detection on input |
-| `_classify_intent(query, context)` | 2 | LLM call for intent classification |
-| `_build_clarification_options(intent_result)` | 3 | Build clarification option list |
-| `_generate_plan(query, intent, tool_list, context)` | 4 | LLM call to decompose query into sub-goals |
-| `_execute_react_step(query, memory, tools, history)` | 5 | Single ReACT iteration via LLM |
-| `_validate_tool_params(tool_name, params, schema)` | 5 | Validate tool call parameters against schema |
-| `_execute_tool(session_id, tool_name, params)` | 5 | Execute tool via Tool Service gRPC |
-| `_validate_tool_result(tool_name, result)` | 5 | Validate tool output completeness |
-| `_get_reflexion_insights(customer_id, intent, query)` | 5 | Fetch past learnings from episodic memory |
-| `_run_react_loop(session_id, ...)` | 5 | Full ReACT loop orchestration |
-| `_run_agent_sub_loop(agent_type, query, ...)` | 6 | Focused 4-iteration ReACT loop for specialist |
-| `_run_multi_agent_loop(session_id, ...)` | 6 | Orchestrate sequential specialist agents |
-| `_synthesize_multi_agent_response(results, query)` | 6 | LLM call to combine specialist outputs |
-| `_frame_response(query, answer, tools, steps)` | 7 | LLM call to polish answer with metadata |
-| `_evaluate_response(query, text, tools, steps, ctx)` | 8 | LLM call to score response quality |
-| `_refine_response(query, text, tools, eval, obs)` | 8 | LLM call to improve response |
-| `_run_reflection_loop(query, framed, tools, steps, ctx)` | 8 | Evaluate-refine loop orchestration |
-| `_check_output_guardrails(response_text)` | 9 | PII redaction on output |
-| `_generate_reflexion_insight(query, intent, ...)` | 10 | LLM call to produce reusable learning |
-| `_maybe_store_reflexion_insight(session_id, ...)` | 10 | Store insight if quality below threshold |
-| `_store_evaluation_record(session_id, ...)` | 11 | Store evaluation metrics to TimescaleDB |
-| `_handle_simple_intent(session_id, ...)` | 2->9->12 | Handle general_question/out_of_scope directly |
+| `_rewrite_query(query, history_turns)` | 2 | LLM call to resolve pronouns/references in the query |
+| `_classify_intent(query, context, previous_intent, previous_entities)` | 3 | LLM call for intent + domain relevance classification |
+| `_handle_session_query(session_id, ...)` | 4.0 | Answer meta-queries from conversation history |
+| `_handle_out_of_scope_redirect(session_id, ...)` | 4.A | Catalog-aware redirect for low domain relevance |
+| `_build_clarification_options(intent_result)` | 4.B | Build context-aware clarification options |
+| `_generate_plan(query, intent, tool_list, context)` | 5 | LLM call to decompose query into sub-goals |
+| `_execute_react_step(query, memory, tools, history, intent)` | 6 | Single ReACT iteration via LLM |
+| `_validate_tool_params(tool_name, params, schema)` | 6 | Validate tool call parameters against schema |
+| `_execute_tool(session_id, tool_name, params)` | 6 | Execute tool via Tool Service gRPC |
+| `_validate_tool_result(tool_name, result)` | 6 | Validate tool output completeness |
+| `_get_reflexion_insights(customer_id, intent, query)` | 6 | Fetch past learnings from episodic memory |
+| `_run_react_loop(session_id, ...)` | 6 | Full ReACT loop orchestration |
+| `_run_agent_sub_loop(agent_type, query, ...)` | 7 | Focused 4-iteration ReACT loop for specialist |
+| `_run_multi_agent_loop(session_id, ...)` | 7 | Orchestrate sequential specialist agents |
+| `_synthesize_multi_agent_response(results, query)` | 7 | LLM call to combine specialist outputs |
+| `_frame_response(query, answer, tools, steps, memory_context)` | 8 | LLM call to polish answer with conversation context |
+| `_evaluate_response(query, text, tools, steps, ctx)` | 9 | LLM call to score response quality |
+| `_refine_response(query, text, tools, eval, obs, memory_context)` | 9 | LLM call to improve response with conversation context |
+| `_run_reflection_loop(query, framed, tools, steps, ctx)` | 9 | Evaluate-refine loop orchestration |
+| `_check_output_guardrails(response_text)` | 10 | PII redaction on output |
+| `_generate_reflexion_insight(query, intent, ...)` | 11 | LLM call to produce reusable learning |
+| `_maybe_store_reflexion_insight(session_id, ...)` | 11 | Store insight if quality below threshold |
+| `_store_evaluation_record(session_id, ...)` | 12 | Store evaluation metrics to TimescaleDB |
+| `_handle_simple_intent(session_id, ...)` | 3->10->13 | Handle general_question directly |
 
 ---
 
@@ -410,7 +449,7 @@ The framing LLM returns structured JSON:
 }
 ```
 
-This framed response then continues through Reflection (Stage 8), Output Guardrails (Stage 9), Reflexion (Stage 10), and finally streams to the client.
+This framed response then continues through Reflection (Stage 9), Output Guardrails (Stage 10), Reflexion (Stage 11), and finally streams to the client.
 
 ### Design Principles
 
@@ -558,7 +597,7 @@ These are two architecturally distinct systems that serve different purposes. Un
 
 ### Reflection Deep Dive — The Post-Response Quality Gate
 
-Reflection is the last chance to fix a response before the user sees it. It sits between Response Framing (Stage 7) and Output Guardrails (Stage 9). The system asks a separate LLM call _"Is this response actually good?"_ — and if not, a second LLM call improves it.
+Reflection is the last chance to fix a response before the user sees it. It sits between Response Framing (Stage 8) and Output Guardrails (Stage 10). The system asks a separate LLM call _"Is this response actually good?"_ — and if not, a second LLM call improves it.
 
 #### The Two LLM Roles
 
@@ -632,7 +671,7 @@ In the UI this appears as:
 
 When the response scores well on the first evaluation (score >= 0.75), the user only sees a single evaluation line — no refining step appears.
 
-#### Connection to Reflexion (Stage 10)
+#### Connection to Reflexion (Stage 11)
 
 Reflection produces two values that Reflexion consumes downstream:
 
@@ -659,7 +698,7 @@ The write path and read path are completely decoupled. They run at different tim
 
 #### Write Path — Generating and Storing Insights
 
-The write path runs at Stage 10, **after** the response has already been streamed to the user. It is entirely non-blocking — failures are logged and swallowed.
+The write path runs at Stage 11, **after** the response has already been streamed to the user. It is entirely non-blocking — failures are logged and swallowed.
 
 **Gate check**: The `original_score` from Reflection's first evaluation (before any refinement) must be below `REFLEXION_INSIGHT_THRESHOLD` (default 0.7). If the agent produced a good response on the first try, there is nothing to learn.
 
@@ -770,25 +809,56 @@ The only client-visible signal is the `reflexion_learning` event, which only app
 
 ## 9. Recommendation Engine
 
-The recommendation service generates contextual suggestions at two points: session start and after each response.
+The recommendation service generates contextual, memory-aware suggestions at two points: session start and after each response. The engine uses **focus-anchored intent strategies** — anchoring suggestions to the product/brand the user is currently discussing, combined with cross-user intelligence and episodic memory deduplication.
 
-### 3-Tier Cold Start Strategy
+### 4-Tier Cold Start Strategy (GetStartRecommendations)
 
-![3-Tier Cold Start Strategy](images/24-cold-start-strategy.svg)
+When a session begins, the system cascades through four tiers to generate up to 5 suggestions:
 
-### Follow-Up Recommendation Pipeline
+![4-Tier Cold Start Strategy](images/24-cold-start-strategy.svg)
 
-After every response, the system generates exactly 3 product-focused follow-up suggestions:
+| Tier | Name | Condition | Strategy |
+|------|------|-----------|----------|
+| **1C** | Returning User Override | Customer has episodic memories | 1 personal suggestion continuing last topic + fill from Tier 1A/1B |
+| **1A** | Cross-User Popular Products | Platform has conversation data | Aggregate product entities across distinct customers, rank by popularity |
+| **1B** | Premium Showcase | No/few popular products | Most expensive product per distinct brand, up to 3 brands |
+| **Generic** | Catalog-Aware Defaults | All tiers above empty | Real brand names and price ranges from the product catalog |
+
+**Tier 1A** counts by **product entity** (not raw query text) — "Tell me about RoboCleaner 3120" and "What's the warranty on RoboCleaner 3120?" count as one mention, not two. Each customer counts once per product.
+
+**Tier 1B** uses `DISTINCT ON (brand)` to pick the most expensive product per brand, ensuring brand diversity. Falls back to the in-memory catalog summary when the DB is unavailable.
+
+### Follow-Up Recommendation Pipeline (GetFollowUpRecommendations)
+
+After every response, the system generates exactly 3 focus-anchored follow-up suggestions:
 
 ![Follow-Up Recommendation Pipeline](images/25-follow-up-pipeline.svg)
 
-#### Gap Analysis Dimensions
+#### Step 1: Extract Current Focus
 
-| Dimension   | Full Set                                                      | Gap = Set Difference                                              |
-| ----------- | ------------------------------------------------------------- | ----------------------------------------------------------------- |
-| **Intents** | product_inquiry, price_check, warranty_question, comparison   | Unused intents, priority: comparison > warranty > price > inquiry |
-| **Brands**  | All brands from product catalog                               | Brands not yet mentioned, sorted by product count                 |
-| **Tools**   | product_search, price_lookup, warranty_check, product_compare | Tools not yet triggered                                           |
+`_extract_current_focus(last_query, last_response, catalog)` derives the user's **current product** and **current brand** from the last exchange only (not the full session). It scans the response first (stronger signal — the response names the product the agent just discussed), then the query. At the same position, longer product names win (e.g., "PowerDrill 5641" beats "PowerDrill 5"). Falls back to brand-only if no full product name is found.
+
+#### Step 2: Intent-Aware Suggestion Strategy (Slots 1-2)
+
+The `INTENT_STRATEGY` dict maps the current intent to two suggestion templates anchored to `{current_product}`:
+
+| Last Intent | Slot 1 | Slot 2 |
+|---|---|---|
+| `product_inquiry` | Warranty on {current_product} | Cost of {current_product} |
+| `price_check` | Warranty on {current_product} | Compare with alternatives in similar price range |
+| `warranty_question` | Price of {current_product} | Compare warranty across brands |
+| `comparison` | Features of {current_product} | Price of {current_product} |
+| `session_query` | Return to {current_product} | Explore new category |
+| `follow_up` | Resolves to **previous** non-follow_up intent's strategy |
+| *(unknown)* | Falls back to `DEFAULT_STRATEGY` |
+
+#### Step 3: Cross-User Intelligence (Slot 3)
+
+`_get_cooccurring_products(current_product, catalog)` finds products that appear in the same sessions as the current product across all customers — "Users who asked about X also explored Y." If no co-occurring products are found, `_find_price_alternative()` picks a product from a different brand within +/-20% of the current product's price.
+
+#### Step 4: Dedup + Pad
+
+Suggestions are deduplicated, filtered against the user's episodic memory (no repeat suggestions for products they've already extensively explored), and the last query echo is removed. If fewer than 3 suggestions remain, `_catalog_aware_generics()` pads with brand-aware fallbacks.
 
 ---
 
@@ -871,9 +941,9 @@ Based on the events emitted during this flow:
 
               Confidence: 91%  |  Sources: UltraWasher 8262, RoboCleaner 3000
 
- Suggestions  "What's the price of RoboCleaner 3000?"
-              "Explore EcoKettle products"
-              "Which product has the longest warranty?"
+ Suggestions  "What's the warranty on RoboCleaner 3000?"
+              "How much does the UltraWasher 8262 cost?"
+              "Users who asked about RoboCleaner 3000 also explored PowerDrill 5641"
 ```
 
 ### What Happens When Quality is Poor
@@ -982,10 +1052,14 @@ Timeout: 30s per gRPC call
 | Tool execution fails | Record observation as error, continue ReACT loop |
 | Redis down | Memory Service falls back to PostgreSQL only |
 | TimescaleDB down | Episodic writes logged and skipped (non-blocking) |
+| Query rewrite fails | Use original query unchanged (non-blocking) |
+| Query rewrite too long | Reject rewrite, use original query |
 | Planning fails | Fall back to unguided single ReACT loop |
 | Reflection parse fails | Skip refinement, use original response |
 | Reflexion store fails | Log warning, continue (non-blocking) |
 | Evaluation store fails | Log warning, continue (non-blocking) |
+| Recommendation co-occurrence DB fails | Fall back to price alternative, then catalog generics |
+| Recommendation premium showcase DB fails | Fall back to in-memory catalog summary |
 
 ---
 
@@ -1005,13 +1079,29 @@ All configuration is centralized in `shared/config.py` and driven by environment
 
 ### Agent Pipeline
 
-| Setting                       | Default | Description                             |
-| ----------------------------- | ------- | --------------------------------------- |
-| `REACT_MAX_ITERATIONS`        | `8`     | Maximum ReACT reasoning steps per query |
-| `REACT_TIMEOUT_SECONDS`       | `120`   | Total pipeline timeout in seconds       |
-| `INTENT_CONFIDENCE_THRESHOLD` | `0.8`   | Below this, ask for clarification       |
+| Setting                       | Default | Description                                          |
+| ----------------------------- | ------- | ---------------------------------------------------- |
+| `REACT_MAX_ITERATIONS`        | `8`     | Maximum ReACT reasoning steps per query              |
+| `REACT_TIMEOUT_SECONDS`       | `120`   | Total pipeline timeout in seconds                    |
+| `INTENT_CONFIDENCE_THRESHOLD` | `0.8`   | Below this, ask for clarification                    |
+| `DOMAIN_RELEVANCE_THRESHOLD`  | `0.5`   | Below this, redirect as out-of-scope                 |
 
-### Reflection (Stage 8)
+### Memory Context
+
+| Setting                          | Default | Description                                        |
+| -------------------------------- | ------- | -------------------------------------------------- |
+| `MEMORY_CONTEXT_MAX_TURNS`       | `10`    | Max conversation turns used for structured context  |
+| `MEMORY_CONTEXT_TRUNCATE_LENGTH` | `200`   | Char limit for older assistant responses in context |
+
+### Query Rewriting
+
+| Setting                      | Default | Description                                            |
+| ---------------------------- | ------- | ------------------------------------------------------ |
+| `QUERY_REWRITE_ENABLED`      | `true`  | Enable LLM-based pronoun/reference resolution          |
+| `QUERY_REWRITE_TEMPERATURE`  | `0.1`   | LLM temperature for query rewrite (low = deterministic)|
+| `QUERY_REWRITE_MAX_TOKENS`   | `128`   | Max tokens for query rewrite response                  |
+
+### Reflection (Stage 9)
 
 | Setting                        | Default | Description                               |
 | ------------------------------ | ------- | ----------------------------------------- |
@@ -1021,7 +1111,7 @@ All configuration is centralized in `shared/config.py` and driven by environment
 | `REFLECTION_TEMPERATURE`       | `0.2`   | LLM temperature for evaluation/refinement |
 | `REFLECTION_MAX_TOKENS`        | `512`   | Max tokens for evaluation/refinement      |
 
-### Reflexion (Stage 10)
+### Reflexion (Stage 11)
 
 | Setting                            | Default | Description                              |
 | ---------------------------------- | ------- | ---------------------------------------- |
@@ -1085,7 +1175,7 @@ All configuration is centralized in `shared/config.py` and driven by environment
 | `TOOL_SERVICE_ADDR` | `tool_service:50056` |
 | `RECOMMENDATION_SERVICE_ADDR` | `recommendation_service:50057` |
 
-When all pipeline features are disabled (`PLANNING_ENABLED=false`, `MULTI_AGENT_ENABLED=false`, `GUARDRAILS_ENABLED=false`, `REFLECTION_ENABLED=false`, `REFLEXION_ENABLED=false`, `EVALUATION_STORAGE_ENABLED=false`), the system operates as a basic ReACT agent with intent classification and tool use.
+When all pipeline features are disabled (`PLANNING_ENABLED=false`, `MULTI_AGENT_ENABLED=false`, `GUARDRAILS_ENABLED=false`, `REFLECTION_ENABLED=false`, `REFLEXION_ENABLED=false`, `EVALUATION_STORAGE_ENABLED=false`, `QUERY_REWRITE_ENABLED=false`), the system operates as a basic ReACT agent with intent classification and tool use.
 
 ---
 
@@ -1097,19 +1187,19 @@ All events streamed to the client via WebSocket during query processing:
 | ----------------------- | ----- | -------------------------------------------- | -------------------------------- |
 | `processing_started`    | 0     | `{}`                                         | Query processing began           |
 | `guardrail_blocked`     | 1     | `{reason, type}`                             | Input blocked by safety filter   |
-| `clarification`         | 3     | `{message, options, allow_freetext}`         | Asking user for more context     |
-| `agent_planning`        | 4     | `{steps[], multi_agent}`                     | Plan decomposition result        |
-| `agent_started`         | 5     | `{agent_type, description}`                  | Specialist agent launched        |
-| `agent_thinking`        | 5     | `{iteration, thought, action, has_answer}`   | ReACT reasoning step             |
-| `tool_validation_error` | 5     | `{tool, error}`                              | Tool parameter validation failed |
-| `agent_complete`        | 5     | `{agent_type, tools_used[]}`                 | Specialist agent finished        |
-| `reflection_evaluating` | 8     | `{iteration}`                                | Evaluating response quality      |
-| `reflection_critique`   | 8     | `{score, issues[], needs_refinement}`        | Quality evaluation result        |
-| `reflection_refining`   | 8     | `{iteration}`                                | Improving response               |
-| `guardrail_sanitized`   | 9     | `{redactions[]}`                             | PII redacted from output         |
-| `reflexion_learning`    | 10    | `{message}`                                  | Learning from poor interaction   |
-| `token`                 | 12    | `{token}`                                    | Streamed response token          |
-| `response_complete`     | 12    | `{text, confidence, sources, suggestions[]}` | Final response with metadata     |
+| `clarification`         | 4.B   | `{message, options, allow_freetext}`         | Asking user for more context     |
+| `agent_planning`        | 5     | `{steps[], multi_agent}`                     | Plan decomposition result        |
+| `agent_started`         | 6     | `{agent_type, description}`                  | Specialist agent launched        |
+| `agent_thinking`        | 6     | `{iteration, thought, action, has_answer}`   | ReACT reasoning step             |
+| `tool_validation_error` | 6     | `{tool, error}`                              | Tool parameter validation failed |
+| `agent_complete`        | 6     | `{agent_type, tools_used[]}`                 | Specialist agent finished        |
+| `reflection_evaluating` | 9     | `{iteration}`                                | Evaluating response quality      |
+| `reflection_critique`   | 9     | `{score, issues[], needs_refinement}`        | Quality evaluation result        |
+| `reflection_refining`   | 9     | `{iteration}`                                | Improving response               |
+| `guardrail_sanitized`   | 10    | `{redactions[]}`                             | PII redacted from output         |
+| `reflexion_learning`    | 11    | `{message}`                                  | Learning from poor interaction   |
+| `token`                 | 13    | `{token}`                                    | Streamed response token          |
+| `response_complete`     | 13    | `{text, confidence, sources, suggestions[]}` | Final response with metadata     |
 | `error`                 | Any   | `{message, code}`                            | Error occurred                   |
 
 ---

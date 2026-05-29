@@ -1,4 +1,4 @@
-"""Recommendation Service — Context-aware, template-based query suggestions."""
+"""Recommendation Service — Context-aware, memory-aware query suggestions."""
 
 import json
 import sys
@@ -53,11 +53,42 @@ FALLBACK_BRANDS = {
 
 # ── All Known Intents & Tools ────────────────────────────────────
 
-ALL_INTENTS = {"product_inquiry", "price_check", "warranty_question", "comparison"}
+ALL_INTENTS = {
+    "product_inquiry", "price_check", "warranty_question",
+    "comparison", "follow_up", "session_query",
+}
 ALL_TOOLS = {"product_search", "price_lookup", "warranty_check", "product_compare"}
 
-# Priority order for suggesting missing intents (most valuable first)
-INTENT_PRIORITY = ["comparison", "warranty_question", "price_check", "product_inquiry"]
+
+# ── Intent Strategy System ────────────────────────────────────────
+
+INTENT_STRATEGY = {
+    "product_inquiry": [
+        "What's the warranty on {current_product}?",
+        "How much does {current_product} cost?",
+    ],
+    "price_check": [
+        "What's the warranty on {current_product}?",
+        "Compare {current_product} with alternatives in a similar price range",
+    ],
+    "warranty_question": [
+        "How much does {current_product} cost?",
+        "Compare warranty options across brands",
+    ],
+    "comparison": [
+        "Tell me about {current_product} features",
+        "How much does {current_product} cost?",
+    ],
+    "session_query": [
+        "Return to {current_product}",
+        "Explore a new product category",
+    ],
+}
+
+DEFAULT_STRATEGY = [
+    "Tell me more about {current_product}",
+    "What's the warranty on {current_product}?",
+]
 
 
 # ── Product Catalog Cache ────────────────────────────────────────
@@ -85,6 +116,7 @@ def _get_product_catalog_summary():
 
         brands = {}
         all_product_names = []
+        products_by_brand = {}
         global_min = float("inf")
         global_max = 0.0
 
@@ -95,13 +127,18 @@ def _get_product_catalog_summary():
             all_product_names.append(name)
 
             # Extract brand (first word of product name)
-            brand = name.split()[0] if name else "Unknown"
+            parts = name.split() if name else []
+            brand = parts[0] if parts else "Unknown"
             if brand not in brands:
                 brands[brand] = {"count": 0, "price_min": price, "price_max": price, "warranties": set()}
             brands[brand]["count"] += 1
             brands[brand]["price_min"] = min(brands[brand]["price_min"], price)
             brands[brand]["price_max"] = max(brands[brand]["price_max"], price)
             brands[brand]["warranties"].add(warranty)
+
+            if brand not in products_by_brand:
+                products_by_brand[brand] = []
+            products_by_brand[brand].append({"name": name, "price": price, "warranty": warranty})
 
             global_min = min(global_min, price)
             global_max = max(global_max, price)
@@ -113,6 +150,7 @@ def _get_product_catalog_summary():
         catalog = {
             "brands": brands,
             "all_product_names": all_product_names,
+            "products_by_brand": products_by_brand,
             "price_min": global_min if global_min != float("inf") else 50.0,
             "price_max": global_max if global_max > 0 else 500.0,
         }
@@ -127,19 +165,90 @@ def _get_product_catalog_summary():
         log.warning("catalog_fetch_failed", error=str(e))
         # Return fallback from hardcoded brand data
         all_names = []
+        products_by_brand = {}
         for brand, info in FALLBACK_BRANDS.items():
+            products_by_brand[brand] = []
             for i in range(info["count"]):
-                all_names.append(f"{brand} {1000 + i}")
+                pname = f"{brand} {1000 + i}"
+                all_names.append(pname)
+                products_by_brand[brand].append({
+                    "name": pname,
+                    "price": info["price_max"],
+                    "warranty": max(info["warranties"]) if info["warranties"] else 12,
+                })
 
         return {
             "brands": {k: dict(v) for k, v in FALLBACK_BRANDS.items()},
             "all_product_names": all_names,
+            "products_by_brand": products_by_brand,
             "price_min": 50.0,
             "price_max": 500.0,
         }
     finally:
         if conn:
             conn.close()
+
+
+# ── Current Focus Extraction ──────────────────────────────────────
+
+def _extract_current_focus(last_query, last_response, catalog):
+    """Derive current_product and current_brand from the last exchange only.
+
+    Scans response first (stronger signal), then query.
+    Picks earliest-position product match for determinism.
+    Falls back to brand-only if no product match.
+    """
+    result = {"current_product": None, "current_brand": None}
+
+    product_names = catalog.get("all_product_names", [])
+    brand_names = set(catalog.get("brands", {}).keys())
+
+    if not product_names and not brand_names:
+        return result
+
+    # Build lowercase lookup, skip blank names
+    product_names_lower = {p.lower(): p for p in product_names if p and p.strip()}
+
+    # Scan response first (stronger signal), then query
+    for text in [last_response, last_query]:
+        if not text:
+            continue
+        text_lower = text.lower()
+
+        # Find earliest-position product match
+        best_product = None
+        best_pos = len(text_lower) + 1
+        for pname_lower, pname in product_names_lower.items():
+            pos = text_lower.find(pname_lower)
+            if pos != -1 and (
+                pos < best_pos
+                or (pos == best_pos and len(pname_lower) > len((best_product or "").lower()))
+            ):
+                best_pos = pos
+                best_product = pname
+
+        if best_product:
+            result["current_product"] = best_product
+            result["current_brand"] = best_product.split()[0] if best_product else None
+            return result
+
+    # Brand-only fallback: scan response then query
+    for text in [last_response, last_query]:
+        if not text:
+            continue
+        text_lower = text.lower()
+        best_brand = None
+        best_pos = len(text_lower) + 1
+        for brand in brand_names:
+            pos = text_lower.find(brand.lower())
+            if pos != -1 and pos < best_pos:
+                best_pos = pos
+                best_brand = brand
+        if best_brand:
+            result["current_brand"] = best_brand
+            return result
+
+    return result
 
 
 # ── Session Context Builder ──────────────────────────────────────
@@ -154,6 +263,8 @@ def _build_session_context(session_id):
         "last_intent": None,
         "last_user_query": None,
         "last_assistant_response": None,
+        "current_product": None,
+        "current_brand": None,
     }
 
     if not session_id:
@@ -213,6 +324,15 @@ def _build_session_context(session_id):
                 for call in calls:
                     if isinstance(call, dict) and "tool" in call:
                         context["tools_used"].add(call["tool"])
+
+        # Extract current focus from the last exchange
+        focus = _extract_current_focus(
+            context["last_user_query"],
+            context["last_assistant_response"],
+            catalog,
+        )
+        context["current_product"] = focus["current_product"]
+        context["current_brand"] = focus["current_brand"]
 
         return context
 
@@ -282,266 +402,407 @@ def _build_customer_profile(customer_id):
         return profile
 
 
-# ── Gap Analysis Engine ──────────────────────────────────────────
+# ── Cross-User Popular Products ───────────────────────────────────
 
-def _gap_analysis(session_context, customer_profile):
-    """Compare what user HAS done vs what they COULD do."""
-    used_intents = session_context["intents_used"] | customer_profile.get("intents_history", set())
-    used_brands = session_context["brands_mentioned"] | customer_profile.get("brands_explored", set())
-    used_tools = session_context["tools_used"] | customer_profile.get("tools_used_historically", set())
+def _get_cross_user_popular_products(catalog, limit=3):
+    """Aggregate popular products by counting unique customers per product entity.
 
-    catalog = _get_product_catalog_summary()
-    all_brands = set(catalog["brands"].keys())
-
-    # Missing intents in priority order
-    missing_intents = [i for i in INTENT_PRIORITY if i not in used_intents]
-
-    # Unexplored brands sorted by product count (descending)
-    unexplored_brands = sorted(
-        [b for b in all_brands if b not in used_brands],
-        key=lambda b: catalog["brands"].get(b, {}).get("count", 0),
-        reverse=True,
-    )
-
-    # Missing tools
-    missing_tools = ALL_TOOLS - used_tools
-
-    # Suggested price range (midpoint of global range)
-    price_mid = int((catalog["price_min"] + catalog["price_max"]) / 2)
-
-    # Suggested warranty brand (brand with longest warranty not yet explored)
-    suggested_warranty_brand = None
-    for brand in unexplored_brands:
-        warranties = catalog["brands"].get(brand, {}).get("warranties", [])
-        if warranties and max(warranties) >= 24:
-            suggested_warranty_brand = brand
-            break
-    if not suggested_warranty_brand and unexplored_brands:
-        suggested_warranty_brand = unexplored_brands[0]
-
-    return {
-        "missing_intents": missing_intents,
-        "unexplored_brands": unexplored_brands,
-        "missing_tools": missing_tools,
-        "suggested_price_range": price_mid,
-        "suggested_warranty_brand": suggested_warranty_brand,
-    }
-
-
-# ── Template System ──────────────────────────────────────────────
-
-TEMPLATES = {
-    ("product_inquiry", "same_product"): [
-        "What's the warranty on {product_name}?",
-        "How much does {product_name} cost?",
-        "Compare {product_name} with similar products",
-    ],
-    ("product_inquiry", "new_brand"): [
-        "Show me {new_brand} products",
-        "What's the most popular {new_brand} product?",
-        "Compare {brand} with {new_brand}",
-    ],
-    ("price_check", "budget_explore"): [
-        "Show me products under ${price_threshold}",
-        "What's the cheapest {new_brand} product?",
-        "Which brand has the best value?",
-    ],
-    ("price_check", "same_product"): [
-        "What's the warranty on {product_name}?",
-        "Compare {product_name} with cheaper alternatives",
-        "Show me similar products in a different price range",
-    ],
-    ("warranty_question", "same_product"): [
-        "How much does {product_name} cost?",
-        "Compare {product_name} with other products",
-        "Show me {new_brand} products with longer warranties",
-    ],
-    ("warranty_question", "explore"): [
-        "Which {new_brand} product has the longest warranty?",
-        "Show me products with at least 24 months warranty",
-        "Compare warranty options across brands",
-    ],
-    ("comparison", "expand"): [
-        "Compare {new_brand} products",
-        "Which brand has the best warranty?",
-        "Show me the top-rated products under ${price_threshold}",
-    ],
-    ("comparison", "same_product"): [
-        "What's the warranty on {product_name}?",
-        "How much does {product_name} cost?",
-        "Show me more {brand} products",
-    ],
-    ("general_question", "explore"): [
-        "Show me {new_brand} products",
-        "Which product has the longest warranty?",
-        "What's the cheapest product available?",
-    ],
-    ("general_question", "same_product"): [
-        "Tell me more about {product_name}",
-        "What's the warranty on {product_name}?",
-        "How much does {product_name} cost?",
-    ],
-}
-
-
-def _select_template_set(intent, context, gaps):
-    """Pick the best template set based on current state."""
-    intent = intent or "general_question"
-    if intent not in {k[0] for k in TEMPLATES}:
-        intent = "general_question"
-
-    # If products were mentioned in context, use same-product templates
-    if context["products_mentioned"]:
-        key = (intent, "same_product")
-        if key in TEMPLATES:
-            return key
-
-    # If there are unexplored brands, use new-brand or explore templates
-    if gaps["unexplored_brands"]:
-        for gap_type in ["new_brand", "budget_explore", "expand", "explore"]:
-            key = (intent, gap_type)
-            if key in TEMPLATES:
-                return key
-
-    # Fallback to explore
-    key = (intent, "explore")
-    if key in TEMPLATES:
-        return key
-
-    # Absolute fallback
-    return ("general_question", "explore")
-
-
-def _fill_templates(templates, context, catalog, gaps):
-    """Fill template placeholders with real data."""
-    filled = []
-    # Sort for deterministic ordering
-    products = sorted(context["products_mentioned"])
-    brands = sorted(context["brands_mentioned"])
-    unexplored = gaps.get("unexplored_brands", [])
-    price_threshold = gaps.get("suggested_price_range", 200)
-
-    product_name = products[0] if products else None
-    brand = brands[0] if brands else None
-    new_brand = unexplored[0] if unexplored else None
-
-    # If no product_name, try to pick one from catalog matching brand
-    if not product_name and brand:
-        for pname in catalog["all_product_names"]:
-            if pname.startswith(brand):
-                product_name = pname
-                break
-
-    # If still no product_name, pick first from catalog
-    if not product_name and catalog["all_product_names"]:
-        product_name = catalog["all_product_names"][0]
-
-    # If no brand, extract from product_name
-    if not brand and product_name:
-        brand = product_name.split()[0]
-
-    # If no new_brand, pick a different brand from catalog
-    if not new_brand:
-        for b in sorted(catalog["brands"].keys()):
-            if b != brand:
-                new_brand = b
-                break
-        if not new_brand:
-            new_brand = brand or "PowerDrill"
-
-    # Guard: ensure brand != new_brand to avoid self-comparison
-    if brand and new_brand and brand == new_brand:
-        for b in sorted(catalog["brands"].keys()):
-            if b != brand:
-                new_brand = b
-                break
-
-    # Track whether brand and new_brand are still identical (single-brand catalog)
-    same_brand = brand and new_brand and brand == new_brand
-
-    for template in templates:
-        # Skip templates that use both {brand} and {new_brand} when they resolve identically
-        if same_brand and "{brand}" in template and "{new_brand}" in template:
-            continue
-        try:
-            result = template.format(
-                product_name=product_name or "this product",
-                brand=brand or new_brand,
-                new_brand=new_brand,
-                price_threshold=price_threshold,
-            )
-            filled.append(result)
-        except (KeyError, IndexError):
-            filled.append(template)
-
-    return filled
-
-
-# ── Cross-User Popular Queries ───────────────────────────────────
-
-def _get_cross_user_popular_queries(limit=5):
-    """Aggregate popular queries from conversation_turns."""
+    Fetches recent user turns, extracts product names via text matching,
+    counts unique customers per product, sorts by count descending.
+    """
     conn = None
     try:
+        product_names = catalog.get("all_product_names", [])
+        if not product_names:
+            return []
+
         conn = get_pg_conn()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
-                "SELECT content, intent, COUNT(*) as freq "
-                "FROM conversation_turns "
-                "WHERE role = 'user' AND intent IS NOT NULL "
-                "AND LENGTH(content) BETWEEN 10 AND 200 "
-                "GROUP BY content, intent "
-                "ORDER BY freq DESC LIMIT %s",
-                (limit,),
+                "SELECT ct.content, s.customer_id "
+                "FROM conversation_turns ct "
+                "JOIN sessions s ON ct.session_id = s.id "
+                "WHERE ct.role = 'user' "
+                "ORDER BY ct.created_at DESC LIMIT 1000"
             )
             rows = cur.fetchall()
-        return [row["content"] for row in rows]
+
+        if not rows:
+            return []
+
+        product_names_lower = {p.lower(): p for p in product_names}
+        # Count unique customers per product
+        product_customers = {}  # product_name -> set of customer_ids
+        for row in rows:
+            content = (row["content"] or "").lower()
+            customer_id = row["customer_id"] or ""
+            for pname_lower, pname in product_names_lower.items():
+                if pname_lower in content:
+                    if pname not in product_customers:
+                        product_customers[pname] = set()
+                    product_customers[pname].add(customer_id)
+
+        if not product_customers:
+            return []
+
+        # Sort by unique customer count descending, then alphabetically for determinism
+        ranked = sorted(
+            product_customers.items(),
+            key=lambda x: (-len(x[1]), x[0]),
+        )
+
+        results = []
+        for product_name, customers in ranked[:limit]:
+            brand = product_name.split()[0] if product_name else ""
+            results.append({
+                "product": product_name,
+                "brand": brand,
+                "customer_count": len(customers),
+            })
+
+        return results
+
     except Exception as e:
-        log.warning("cross_user_queries_failed", error=str(e))
+        log.warning("cross_user_popular_products_failed", error=str(e))
         return []
     finally:
         if conn:
             conn.close()
 
 
-# ── Gap-Based Fallback Suggestions ───────────────────────────────
+# ── Co-occurring Products ─────────────────────────────────────────
 
-def _gap_fallbacks(gaps, catalog):
-    """Generate fallback suggestions from gap analysis."""
+def _get_cooccurring_products(current_product, catalog, limit=3):
+    """Find products that co-occur with current_product across sessions.
+
+    Two-step SQL:
+    1. Find sessions where current_product appears (LIMIT 100)
+    2. Get all content from those sessions, count co-occurring product entities
+    """
+    if not current_product:
+        return []
+
+    conn = None
+    try:
+        product_names = catalog.get("all_product_names", [])
+        if not product_names:
+            return []
+
+        conn = get_pg_conn()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Step 1: Find sessions mentioning current_product
+            # Escape LIKE wildcards in product name to prevent unintended matching
+            escaped = current_product.lower().replace("%", "\\%").replace("_", "\\_")
+            search_term = f"%{escaped}%"
+            cur.execute(
+                "SELECT DISTINCT session_id FROM conversation_turns "
+                "WHERE LOWER(content) LIKE %s LIMIT 100",
+                (search_term,),
+            )
+            session_rows = cur.fetchall()
+
+            if not session_rows:
+                return []
+
+            session_ids = [r["session_id"] for r in session_rows]
+
+            # Step 2: Get all content from those sessions
+            cur.execute(
+                "SELECT content FROM conversation_turns "
+                "WHERE session_id = ANY(%s)",
+                (session_ids,),
+            )
+            content_rows = cur.fetchall()
+
+        product_names_lower = {p.lower(): p for p in product_names}
+        current_lower = current_product.lower()
+        cooccurrence = {}  # product_name -> count
+
+        for row in content_rows:
+            content = (row["content"] or "").lower()
+            for pname_lower, pname in product_names_lower.items():
+                if pname_lower == current_lower:
+                    continue
+                if pname_lower in content:
+                    cooccurrence[pname] = cooccurrence.get(pname, 0) + 1
+
+        if not cooccurrence:
+            return []
+
+        ranked = sorted(
+            cooccurrence.items(),
+            key=lambda x: (-x[1], x[0]),
+        )
+
+        return [product for product, _ in ranked[:limit]]
+
+    except Exception as e:
+        log.warning("cooccurring_products_failed", error=str(e))
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+# ── Premium Showcase Products ─────────────────────────────────────
+
+def _get_premium_showcase_products(catalog, limit=3):
+    """Most expensive product per distinct brand, top N brands by price.
+
+    Uses DB query with DISTINCT ON (brand logic), falls back to catalog summary.
+    """
+    conn = None
+    try:
+        conn = get_pg_conn()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (SPLIT_PART(product_name, ' ', 1)) "
+                "product_name, price, SPLIT_PART(product_name, ' ', 1) AS brand "
+                "FROM products "
+                "ORDER BY SPLIT_PART(product_name, ' ', 1), price DESC"
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return _premium_showcase_from_catalog(catalog, limit)
+
+        # Sort by price descending, pick top N distinct brands
+        sorted_rows = sorted(rows, key=lambda r: float(r["price"]), reverse=True)
+        results = []
+        seen_brands = set()
+        for row in sorted_rows:
+            brand = row["brand"]
+            if brand in seen_brands:
+                continue
+            seen_brands.add(brand)
+            results.append({
+                "product": row["product_name"],
+                "brand": brand,
+                "price": float(row["price"]),
+            })
+            if len(results) >= limit:
+                break
+
+        return results
+
+    except Exception as e:
+        log.warning("premium_showcase_failed", error=str(e))
+        return _premium_showcase_from_catalog(catalog, limit)
+    finally:
+        if conn:
+            conn.close()
+
+
+def _premium_showcase_from_catalog(catalog, limit=3):
+    """Fallback: derive premium products from catalog summary brand-level data."""
+    products_by_brand = catalog.get("products_by_brand", {})
+    brands_info = catalog.get("brands", {})
+
+    results = []
+
+    if products_by_brand:
+        # Pick most expensive product from each brand
+        for brand, products in products_by_brand.items():
+            if not products:
+                continue
+            top = max(products, key=lambda p: p["price"])
+            results.append({
+                "product": top["name"],
+                "brand": brand,
+                "price": top["price"],
+            })
+    elif brands_info:
+        # Use brand-level price_max
+        for brand, info in brands_info.items():
+            results.append({
+                "product": f"{brand} Premium",
+                "brand": brand,
+                "price": info.get("price_max", 0),
+            })
+
+    # Sort by price descending, pick top N distinct brands
+    results.sort(key=lambda r: r["price"], reverse=True)
+    seen_brands = set()
+    filtered = []
+    for r in results:
+        if r["brand"] in seen_brands:
+            continue
+        seen_brands.add(r["brand"])
+        filtered.append(r)
+        if len(filtered) >= limit:
+            break
+
+    return filtered
+
+
+# ── Price Alternative Finder ──────────────────────────────────────
+
+def _find_price_alternative(current_product, current_brand, catalog):
+    """Find a product from a different brand at a similar price point (±20%).
+
+    Falls back to first product from a different brand in catalog.
+    """
+    if not current_product:
+        return None
+
+    conn = None
+    try:
+        conn = get_pg_conn()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            # Get current product's price
+            cur.execute(
+                "SELECT price FROM products WHERE product_name = %s",
+                (current_product,),
+            )
+            row = cur.fetchone()
+
+            if not row:
+                return _price_alternative_from_catalog(current_product, current_brand, catalog)
+
+            price = float(row["price"])
+            low = price * 0.8
+            high = price * 1.2
+
+            # Find products in ±20% from different brands
+            if current_brand:
+                cur.execute(
+                    "SELECT product_name, price FROM products "
+                    "WHERE price BETWEEN %s AND %s "
+                    "AND NOT product_name LIKE %s "
+                    "ORDER BY ABS(price - %s) ASC LIMIT 1",
+                    (low, high, f"{current_brand}%", price),
+                )
+            else:
+                # No brand to exclude — just find nearest price match that isn't the same product
+                cur.execute(
+                    "SELECT product_name, price FROM products "
+                    "WHERE price BETWEEN %s AND %s "
+                    "AND product_name != %s "
+                    "ORDER BY ABS(price - %s) ASC LIMIT 1",
+                    (low, high, current_product, price),
+                )
+            alt_row = cur.fetchone()
+
+            if alt_row:
+                return alt_row["product_name"]
+
+    except Exception as e:
+        log.warning("price_alternative_failed", error=str(e))
+
+    finally:
+        if conn:
+            conn.close()
+
+    return _price_alternative_from_catalog(current_product, current_brand, catalog)
+
+
+def _price_alternative_from_catalog(current_product, current_brand, catalog):
+    """Fallback: find first product from a different brand in catalog."""
+    for pname in catalog.get("all_product_names", []):
+        pbrand = pname.split()[0] if pname else ""
+        if pbrand and pbrand != current_brand:
+            return pname
+    return None
+
+
+# ── Focus-Anchored Suggestion Builder ─────────────────────────────
+
+def _build_focus_anchored_suggestions(current_focus, intent, session_ctx, catalog, profile):
+    """Build 3 context-aware suggestions anchored to current focus.
+
+    Slot 1-2: From INTENT_STRATEGY based on effective intent.
+    Slot 3: Cross-user co-occurrence or price alternative.
+    Filters against episodic memory topics to avoid repeats.
+    """
+    current_product = current_focus.get("current_product")
+    current_brand = current_focus.get("current_brand")
     suggestions = []
-    unexplored = gaps.get("unexplored_brands", [])
-    missing_intents = gaps.get("missing_intents", [])
-    price_mid = gaps.get("suggested_price_range", 200)
-    brand_keys = list(catalog.get("brands", {}).keys())
 
-    if not brand_keys and not unexplored:
-        # No brand data at all — return generic suggestions
-        suggestions.append(f"Show me products under ${price_mid}")
-        suggestions.append("Which products come with the longest warranty?")
-        suggestions.append("What products do you have?")
-        return suggestions
+    # Resolve effective intent: follow_up chains resolve to last non-follow_up intent
+    effective_intent = intent
+    if intent == "follow_up":
+        last = session_ctx.get("last_intent")
+        if last and last != "follow_up":
+            effective_intent = last
 
-    for intent in missing_intents:
-        brand = unexplored[0] if unexplored else brand_keys[0]
-        if intent == "comparison" and len(brand_keys) >= 2:
-            suggestions.append(f"Compare {brand_keys[0]} with {brand_keys[1]}")
-        elif intent == "warranty_question":
-            suggestions.append(f"What warranty does {brand} offer?")
-        elif intent == "price_check":
-            suggestions.append(f"Show me products under ${price_mid}")
-        elif intent == "product_inquiry":
-            suggestions.append(f"Tell me about {brand} products")
-        if len(suggestions) >= 3:
-            break
+    # Get strategy templates
+    strategy = INTENT_STRATEGY.get(effective_intent, DEFAULT_STRATEGY)
 
-    for brand in unexplored[:2]:
-        if len(suggestions) >= 3:
-            break
-        s = f"Show me {brand} products"
-        if s not in suggestions:
-            suggestions.append(s)
+    # Fill slots 1-2 from strategy
+    for template in strategy[:2]:
+        if current_product:
+            filled = template.replace("{current_product}", current_product)
+            filled = filled.replace("{current_brand}", current_brand or "")
+        elif current_brand:
+            # Brand-only: adapt templates
+            filled = template.replace("{current_product}", f"{current_brand} products")
+            filled = filled.replace("{current_brand}", current_brand)
+        else:
+            continue
+        suggestions.append(filled)
+
+    # Slot 3: Cross-user co-occurrence
+    slot3 = None
+    if current_product:
+        try:
+            cooccurring = _get_cooccurring_products(current_product, catalog, limit=3)
+            # Filter against session history + episodic memory
+            explored_topics = set(t.lower() for t in profile.get("topics_explored", []))
+            mentioned = set(p.lower() for p in session_ctx.get("products_mentioned", set()))
+            for coprod in cooccurring:
+                if coprod.lower() not in explored_topics and coprod.lower() not in mentioned:
+                    slot3 = f"Users who asked about {current_product} also explored {coprod}"
+                    break
+        except Exception:
+            pass
+
+    # Slot 3 fallback: price alternative
+    if not slot3 and current_product:
+        try:
+            alt = _find_price_alternative(current_product, current_brand, catalog)
+            if alt:
+                slot3 = f"Compare {current_product} with {alt}"
+        except Exception:
+            pass
+
+    if slot3:
+        suggestions.append(slot3)
 
     return suggestions
+
+
+# ── Generic Catalog-Aware Fallbacks ───────────────────────────────
+
+def _catalog_aware_generics(catalog, exclude=None):
+    """Generate generic catalog-aware suggestions for padding."""
+    exclude = exclude or set()
+    brand_list = list(catalog.get("brands", {}).keys())
+    price_mid = int((catalog.get("price_min", 50) + catalog.get("price_max", 500)) / 2)
+
+    generics = []
+    if brand_list:
+        generics.append(f"Tell me about {brand_list[0]} products")
+    generics.append(f"Show me products under ${price_mid}")
+    generics.append("Which products come with the longest warranty?")
+    if len(brand_list) >= 2:
+        generics.append(f"Compare {brand_list[0]} with {brand_list[1]}")
+    if len(brand_list) >= 3:
+        generics.append(f"Show me {brand_list[2]} products")
+
+    if len(generics) < 3:
+        extras = [
+            "What products do you have?",
+            f"Show me products under ${price_mid}",
+            "Which products come with the longest warranty?",
+        ]
+        for e in extras:
+            if e not in generics:
+                generics.append(e)
+            if len(generics) >= 5:
+                break
+
+    exclude_lower = {e.lower() for e in exclude}
+    return [g for g in generics if g.lower() not in exclude_lower]
 
 
 # ── gRPC Service Implementation ──────────────────────────────────
@@ -549,124 +810,80 @@ def _gap_fallbacks(gaps, catalog):
 class RecommendationServiceServicer(pb2_grpc.RecommendationServiceServicer):
 
     def GetStartRecommendations(self, request, context):
-        """3-tier cold start: returning user > cross-user popular > catalog-aware defaults."""
+        """3-tier cold start: 1C (returning user) → 1A (popular products) → 1B (premium showcase) → generic."""
         customer_id = request.customer_id
         session_id = request.session_id
 
         suggestions = []
         catalog = _get_product_catalog_summary()
 
-        # ── Tier 1: Returning user with episodic memories ──
+        # ── Tier 1C: Returning user with episodic memories ──
+        personal_suggestion = None
         if customer_id:
             try:
                 profile = _build_customer_profile(customer_id)
-                if profile["has_history"]:
-                    gaps = _gap_analysis(
-                        {
-                            "intents_used": set(),
-                            "brands_mentioned": set(),
-                            "tools_used": set(),
-                            "products_mentioned": set(),
-                        },
-                        profile,
-                    )
-
-                    # Suggestion 1: Continue from last topic
-                    if profile["topics_explored"]:
-                        last_topic = profile["topics_explored"][0]
-                        suggestions.append(f"Show me the latest on {last_topic}")
-
-                    # Suggestion 2: Unexplored brand with price range
-                    unexplored = gaps["unexplored_brands"]
-                    if unexplored:
-                        brand = unexplored[0]
-                        info = catalog["brands"].get(brand, {})
-                        p_min = int(info.get("price_min", 50))
-                        p_max = int(info.get("price_max", 500))
-                        suggestions.append(
-                            f"Explore {brand} products (${p_min}-${p_max})"
-                        )
-
-                    # Suggestion 3: Missing intent with real data
-                    if gaps["missing_intents"]:
-                        top_intent = gaps["missing_intents"][0]
-                        brands_list = list(catalog["brands"].keys())
-                        if top_intent == "comparison":
-                            if len(brands_list) >= 2:
-                                suggestions.append(
-                                    f"Compare {brands_list[0]} with {brands_list[1]}"
-                                )
-                        elif top_intent == "warranty_question":
-                            wb = gaps["suggested_warranty_brand"] or (brands_list[0] if brands_list else None)
-                            if wb:
-                                suggestions.append(
-                                    f"What warranty does {wb} offer?"
-                                )
-                            else:
-                                suggestions.append(
-                                    "Which products come with the longest warranty?"
-                                )
-                        elif top_intent == "price_check":
-                            suggestions.append(
-                                f"Show me products under ${gaps['suggested_price_range']}"
-                            )
-                        elif top_intent == "product_inquiry":
-                            if unexplored:
-                                suggestions.append(
-                                    f"Tell me about {unexplored[0]} products"
-                                )
-                            elif brands_list:
-                                suggestions.append(
-                                    f"Tell me about {brands_list[0]} products"
-                                )
-
-                    if suggestions:
-                        log.info("start_recommendations_tier1", count=len(suggestions), customer_id=customer_id)
+                if profile["has_history"] and profile["topics_explored"]:
+                    last_topic = profile["topics_explored"][0]
+                    personal_suggestion = f"Continue where you left off: {last_topic}"
+                    suggestions.append(personal_suggestion)
+                    log.info("start_recommendations_tier1c", customer_id=customer_id)
             except Exception as e:
-                log.warning("tier1_failed", error=str(e))
+                log.warning("tier1c_failed", error=str(e))
 
-        # ── Tier 2: Cross-user popular queries ──
+        # ── Tier 1A: Cross-user popular products ──
         if len(suggestions) < 3:
             try:
-                popular = _get_cross_user_popular_queries(limit=5)
-                for q in popular:
-                    if q not in suggestions:
-                        suggestions.append(q)
-                    if len(suggestions) >= 5:
+                popular = _get_cross_user_popular_products(catalog, limit=3)
+                seen_lower = {s.lower() for s in suggestions}
+                for item in popular:
+                    product = item["product"]
+                    brand = item["brand"]
+                    suggestion = f"Tell me about {product} — our most popular {brand}"
+                    if suggestion.lower() not in seen_lower:
+                        suggestions.append(suggestion)
+                        seen_lower.add(suggestion.lower())
+                    if len(suggestions) >= 3:
                         break
                 if popular:
-                    log.info("start_recommendations_tier2", count=len(popular))
+                    log.info("start_recommendations_tier1a", count=len(popular))
             except Exception as e:
-                log.warning("tier2_failed", error=str(e))
+                log.warning("tier1a_failed", error=str(e))
 
-        # ── Tier 3: Catalog-aware defaults ──
+        # ── Tier 1B: Premium showcase ──
         if len(suggestions) < 3:
-            brand_names = list(catalog["brands"].keys())
-            price_mid = int((catalog["price_min"] + catalog["price_max"]) / 2)
+            try:
+                premium = _get_premium_showcase_products(catalog, limit=3)
+                seen_lower = {s.lower() for s in suggestions}
+                for item in premium:
+                    product = item["product"]
+                    brand = item["brand"]
+                    price = int(item["price"])
+                    suggestion = f"Check out {product} (${price}) — our premium {brand}"
+                    if suggestion.lower() not in seen_lower:
+                        suggestions.append(suggestion)
+                        seen_lower.add(suggestion.lower())
+                    if len(suggestions) >= 3:
+                        break
+                if premium:
+                    log.info("start_recommendations_tier1b", count=len(premium))
+            except Exception as e:
+                log.warning("tier1b_failed", error=str(e))
 
-            defaults = []
-            if brand_names:
-                defaults.append(f"Tell me about {brand_names[0]} products")
-            defaults.append(f"Show me products under ${price_mid}")
-            defaults.append("Which products come with the longest warranty?")
-            if len(brand_names) >= 2:
-                defaults.append(f"Compare {brand_names[0]} with {brand_names[1]}")
-            if len(brand_names) >= 3:
-                defaults.append(f"Show me {brand_names[2]} products")
-
-            for d in defaults:
-                if d not in suggestions:
-                    suggestions.append(d)
+        # ── Generic catalog-aware fallback ──
+        if len(suggestions) < 3:
+            generics = _catalog_aware_generics(catalog, exclude=set(suggestions))
+            for g in generics:
+                if g not in suggestions:
+                    suggestions.append(g)
                 if len(suggestions) >= 5:
                     break
-
-            log.info("start_recommendations_tier3", count=len(suggestions))
+            log.info("start_recommendations_generic", count=len(suggestions))
 
         log.info("start_recommendations", count=len(suggestions), customer_id=customer_id)
         return pb2.RecommendationResponse(suggestions=suggestions[:5])
 
     def GetFollowUpRecommendations(self, request, context):
-        """Context-aware follow-up suggestions using gap analysis and templates."""
+        """Context-aware follow-up: extract focus → intent strategy → cross-user slot 3 → dedup → pad."""
         session_id = request.session_id
         last_query = request.last_query
         last_response = request.last_response
@@ -682,15 +899,22 @@ class RecommendationServiceServicer(pb2_grpc.RecommendationServiceServicer):
         if last_query:
             session_ctx["last_user_query"] = last_query
         if intent:
-            session_ctx["last_intent"] = intent
             session_ctx["intents_used"].add(intent)
+            # Preserve previous intent for follow_up resolution;
+            # only overwrite last_intent when the current turn is NOT a follow_up.
+            if intent != "follow_up":
+                session_ctx["last_intent"] = intent
         if last_response:
             session_ctx["last_assistant_response"] = last_response
 
-        # Extract product/brand mentions from last_query and last_response
+        # 2. Extract current focus from last exchange
+        focus = _extract_current_focus(last_query, last_response, catalog)
+        session_ctx["current_product"] = focus["current_product"]
+        session_ctx["current_brand"] = focus["current_brand"]
+
+        # Also update products_mentioned / brands_mentioned from last exchange
         brand_names = set(catalog["brands"].keys())
         product_names_lower = {p.lower(): p for p in catalog["all_product_names"]}
-
         for text in [last_query, last_response]:
             if not text:
                 continue
@@ -702,7 +926,7 @@ class RecommendationServiceServicer(pb2_grpc.RecommendationServiceServicer):
                 if brand.lower() in text_lower:
                     session_ctx["brands_mentioned"].add(brand)
 
-        # 2. Resolve customer_id if not provided
+        # 3. Resolve customer_id if not provided
         if not customer_id and session_id:
             try:
                 conn = get_pg_conn()
@@ -720,20 +944,15 @@ class RecommendationServiceServicer(pb2_grpc.RecommendationServiceServicer):
             except Exception as e:
                 log.warning("customer_id_lookup_failed", error=str(e))
 
-        # 3. Build customer profile
+        # 4. Build customer profile
         profile = _build_customer_profile(customer_id)
 
-        # 4. Run gap analysis
-        gaps = _gap_analysis(session_ctx, profile)
+        # 5. Build focus-anchored suggestions
+        suggestions = _build_focus_anchored_suggestions(
+            focus, intent, session_ctx, catalog, profile,
+        )
 
-        # 5. Select template set
-        template_key = _select_template_set(intent, session_ctx, gaps)
-        templates = TEMPLATES.get(template_key, TEMPLATES[("general_question", "explore")])
-
-        # 6. Fill templates
-        suggestions = _fill_templates(templates, session_ctx, catalog, gaps)
-
-        # 7. Deduplicate, exclude echo of last query
+        # 6. Deduplicate, exclude echo of last query
         seen = set()
         deduped = []
         last_q_lower = (last_query or "").strip().lower()
@@ -749,30 +968,14 @@ class RecommendationServiceServicer(pb2_grpc.RecommendationServiceServicer):
 
         suggestions = deduped
 
-        # 8. Gap-based fallbacks if < 3 suggestions
+        # 7. Pad to 3 from catalog-aware generics if needed
         if len(suggestions) < 3:
-            fallbacks = _gap_fallbacks(gaps, catalog)
-            for fb in fallbacks:
-                fb_lower = fb.strip().lower()
-                if fb_lower not in seen and fb_lower != last_q_lower:
-                    suggestions.append(fb)
-                    seen.add(fb_lower)
-                if len(suggestions) >= 3:
-                    break
-
-        # 9. Absolute fallback: catalog-aware generics
-        if len(suggestions) < 3:
-            brand_list = list(catalog["brands"].keys())
-            generic_fallbacks = [
-                f"Tell me about {brand_list[0]} products" if brand_list else "What products do you have?",
-                f"Show me products under ${int((catalog['price_min'] + catalog['price_max']) / 2)}",
-                "Which products come with the longest warranty?",
-            ]
-            for gf in generic_fallbacks:
-                gf_lower = gf.strip().lower()
-                if gf_lower not in seen and gf_lower != last_q_lower:
-                    suggestions.append(gf)
-                    seen.add(gf_lower)
+            generics = _catalog_aware_generics(catalog, exclude=set(suggestions))
+            for g in generics:
+                g_lower = g.strip().lower()
+                if g_lower not in seen and g_lower != last_q_lower:
+                    suggestions.append(g)
+                    seen.add(g_lower)
                 if len(suggestions) >= 3:
                     break
 

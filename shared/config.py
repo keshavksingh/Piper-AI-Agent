@@ -60,6 +60,16 @@ class Config:
     REACT_MAX_ITERATIONS: int = _safe_int("REACT_MAX_ITERATIONS", 8)
     REACT_TIMEOUT_SECONDS: int = _safe_int("REACT_TIMEOUT_SECONDS", 120)
     INTENT_CONFIDENCE_THRESHOLD: float = _safe_float("INTENT_CONFIDENCE_THRESHOLD", 0.8)
+    DOMAIN_RELEVANCE_THRESHOLD: float = _safe_float("DOMAIN_RELEVANCE_THRESHOLD", 0.5)
+
+    # Memory Context
+    MEMORY_CONTEXT_MAX_TURNS: int = _safe_int("MEMORY_CONTEXT_MAX_TURNS", 10)
+    MEMORY_CONTEXT_TRUNCATE_LENGTH: int = _safe_int("MEMORY_CONTEXT_TRUNCATE_LENGTH", 200)
+
+    # Query Rewriting (conversational context resolution)
+    QUERY_REWRITE_ENABLED: bool = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() == "true"
+    QUERY_REWRITE_TEMPERATURE: float = _safe_float("QUERY_REWRITE_TEMPERATURE", 0.1)
+    QUERY_REWRITE_MAX_TOKENS: int = _safe_int("QUERY_REWRITE_MAX_TOKENS", 128)
 
     # Reflection Agent
     REFLECTION_ENABLED: bool = os.getenv("REFLECTION_ENABLED", "true").lower() == "true"
