@@ -67,15 +67,69 @@ def get_rec_stub():
 
 INTENT_CLASSIFICATION_PROMPT = """Classify the user's intent based on their query and conversation context.
 
+This is a product catalog for home appliances and tools. The catalog contains these product categories:
+- PowerDrill (power tools)
+- RoboCleaner (robot vacuum cleaners)
+- MegaBlender (kitchen blenders)
+- NoiseCanceller (noise cancelling devices)
+- AirPurifier (air purifiers)
+- EcoKettle (electric kettles)
+- ThermoBottle (insulated bottles)
+- UltraWasher (washing machines)
+- SuperVac (vacuum cleaners)
+- SmartLamp (smart lighting)
+
 Conversation context:
 {context}
 
+Previous turn intent: {previous_intent}
+Previous turn entities/tools: {previous_entities}
+
 User query: {query}
+
+Instructions for each field:
+
+"domain_relevance" (0.0-1.0): How related is this query to our product catalog?
+  - HIGH (0.7-1.0): Query is about products, appliances, tools, prices, warranties, comparisons, cleaning, cooking, lighting, air quality, drilling, washing, or home equipment.
+  - MEDIUM (0.4-0.6): Query is vague but COULD be product-related (e.g. "help", "what can you do", "I need something").
+  - LOW (0.0-0.3): Query is clearly about unrelated topics (music, entertainment, travel, sports, news, coding, recipes, weather, math, personal advice, etc.).
+  - SPECIAL: Queries about the conversation itself (e.g. "what have I asked so far", "summarize our chat") should get HIGH relevance (0.8+) because they relate to this session.
+
+"needs_clarification": Set to true ONLY when the query is product-related (domain_relevance >= 0.4) but the specific intent is ambiguous. Examples:
+  - "I need something for cleaning" -> true (could be RoboCleaner, SuperVac, or UltraWasher)
+  - "Which one is better?" -> true (compare what exactly?)
+  - "What's the cheapest?" -> true (in which product category?)
+  - "Help" or "What can you do?" -> true (user might need product guidance)
+  Do NOT set true when:
+  - The query is clearly not about products (e.g. "play me a song") -> use out_of_scope instead
+  - The query is clear enough to act on (e.g. "price of UltraWasher 8262")
+  - The intent is follow_up — follow-ups should NEVER need clarification
+
+"clarification_question": When needs_clarification is true, write a specific, helpful question. Reference actual product categories when possible.
+
+Follow-up detection rules:
+When the previous turn involved a product discussion (comparison, product_inquiry, price_check, warranty_question), these patterns indicate a follow_up intent:
+  - "Help me decide" → follow_up (after comparison)
+  - "Which one should I get?" → follow_up (after product listing)
+  - "What about the warranty?" → follow_up (after product details)
+  - "The cheaper one" → follow_up (referencing previous options)
+  - "I need it for [usage]" → follow_up (adding context to previous discussion)
+  - "Tell me more" or "Go on" → follow_up (continuing previous topic)
+If the previous intent was a product-related intent and the current query references or continues that discussion, classify as follow_up with high confidence and high domain_relevance.
+
+Session query detection:
+Queries about the conversation itself should be classified as session_query:
+  - "What are all the queries I have asked so far" → session_query
+  - "Summarize our conversation" → session_query
+  - "What products have we discussed" → session_query
+  - "What did I ask earlier" → session_query
+These should get domain_relevance of 0.8+ since they relate to this support session.
 
 Respond with valid JSON only, no markdown:
 {{
-  "intent": "product_inquiry|price_check|comparison|warranty_question|general_question|follow_up|out_of_scope",
+  "intent": "product_inquiry|price_check|comparison|warranty_question|general_question|follow_up|session_query|out_of_scope",
   "confidence": 0.0-1.0,
+  "domain_relevance": 0.0-1.0,
   "entities": ["extracted product names or attributes"],
   "needs_clarification": true or false,
   "clarification_question": "question to ask if ambiguous (empty string if not needed)"
@@ -93,6 +147,8 @@ Rules:
 - Use tools to get factual information; do not make up product details
 - If you have enough information, provide a Final Answer
 - Be concise in your thoughts
+- The user query has already been rewritten to be self-contained (pronouns resolved). Trust the product names in the query and use them directly in tool calls.
+- Answer with the information you have. If tool results are partial, provide what you found rather than asking for clarification.
 - Format your response as exactly one of these two patterns:
 
 Pattern 1 (need more info):
@@ -106,6 +162,8 @@ Answer: [your final response to the user]"""
 REACT_USER_PROMPT = """Session context:
 {memory_context}
 
+Classified intent: {intent}
+
 User query: {query}
 
 {react_history}
@@ -114,12 +172,15 @@ Continue the reasoning. Respond with a Thought and either an Action or an Answer
 
 RESPONSE_FRAMING_PROMPT = """You are framing a final response for the user based on the agent's reasoning.
 
+Conversation context:
+{memory_context}
+
 Original query: {query}
 Agent's answer: {answer}
 Tools used: {tools_used}
 Reasoning steps: {reasoning_steps}
 
-Create a helpful, natural response. Include the factual information found.
+Create a helpful, natural response. Include the factual information found. Frame your response as a direct answer to the query.
 Respond with valid JSON only, no markdown:
 {{
   "text": "your polished response to the user",
@@ -159,12 +220,15 @@ Respond with valid JSON only, no markdown:
 
 REFLECTION_REFINE_PROMPT = """Improve this customer support response based on the critique.
 
+Conversation context:
+{memory_context}
+
 User query: {query}
 Original response: {response_text}
 Critique: {critique}
 Tool observations: {observations}
 
-Produce an improved response that addresses the identified issues.
+Produce an improved response that addresses the identified issues. The query has already been resolved to be self-contained — answer it directly.
 Respond with valid JSON only, no markdown:
 {{
   "text": "your improved response to the user",
@@ -302,16 +366,139 @@ def build_react_history(steps: list) -> str:
     return history
 
 
+_CATALOG_PRODUCTS = [
+    "PowerDrill", "RoboCleaner", "MegaBlender", "NoiseCanceller",
+    "AirPurifier", "EcoKettle", "ThermoBottle", "UltraWasher",
+    "SuperVac", "SmartLamp",
+]
+
+
+# ── Query Rewrite Prompt ─────────────────────────────────────────
+
+QUERY_REWRITE_PROMPT = """Given the conversation history below, rewrite the user's latest query to be fully self-contained.
+
+Rules:
+- Replace ALL pronouns and references ("this", "it", "that one", "the cheaper one", etc.) with the specific product names or details they refer to from the conversation history.
+- Resolve ellipsis: if the user asks "What about the warranty?" after discussing a product, rewrite to include the product name.
+- If the query is already self-contained (no ambiguous references), return it unchanged.
+- Return ONLY the rewritten query text, nothing else. No explanation, no quotes, no prefix.
+
+Conversation history:
+{history}
+
+Latest user query: {query}
+
+Rewritten query:"""
+
+
 def build_memory_context(turns) -> str:
-    """Build context string from conversation turns."""
+    """Build structured context string from conversation turns.
+
+    Produces three sections:
+    1. Conversation Flow — a semantic summary of each exchange (what was asked,
+       what was answered) so the LLM sees the shape of the conversation.
+    2. Active Context — products mentioned, intents used, tools called.
+    3. Recent Exchange — the latest user+assistant turn preserved in full
+       so the LLM has complete detail for the most recent topic.
+    """
     if not turns:
         return "No previous conversation."
 
-    lines = []
-    for turn in turns[-10:]:  # Last 10 turns
-        role_label = "User" if turn.role == "user" else "Assistant"
-        lines.append(f"{role_label}: {turn.content}")
-    return "\n".join(lines)
+    max_turns = Config.MEMORY_CONTEXT_MAX_TURNS
+    truncate_len = Config.MEMORY_CONTEXT_TRUNCATE_LENGTH
+
+    # ── Section 1: Conversation Flow ─────────────────────────────
+    # Pair user+assistant turns into exchanges for a semantic overview
+    flow_lines = ["=== Conversation Flow ==="]
+    exchange_num = 0
+    i = 0
+    turn_list = list(turns[-max_turns:])
+    while i < len(turn_list):
+        turn = turn_list[i]
+        if turn.role == "user":
+            exchange_num += 1
+            user_content = turn.content or ""
+            # Look for the next assistant turn
+            assistant_summary = "(no response yet)"
+            if i + 1 < len(turn_list) and turn_list[i + 1].role == "assistant":
+                asst_turn = turn_list[i + 1]
+                asst_content = asst_turn.content or ""
+                intent = getattr(asst_turn, "intent", None)
+                intent_tag = f" [{intent}]" if intent else ""
+                # Summarize older assistant turns, keep latest in full in Section 3
+                if i + 1 < len(turn_list) - 1 and len(asst_content) > truncate_len:
+                    assistant_summary = asst_content[:truncate_len] + "..." + intent_tag
+                else:
+                    assistant_summary = asst_content + intent_tag
+                i += 1  # skip the assistant turn
+            flow_lines.append(f"{exchange_num}. User: {user_content}")
+            flow_lines.append(f"   Assistant: {assistant_summary}")
+        else:
+            # Standalone assistant turn (e.g. clarification without preceding user turn)
+            exchange_num += 1
+            content = turn.content or ""
+            intent = getattr(turn, "intent", None)
+            intent_tag = f" [{intent}]" if intent else ""
+            flow_lines.append(f"{exchange_num}. Assistant{intent_tag}: {content}")
+        i += 1
+
+    # ── Section 2: Active Context ────────────────────────────────
+    products_mentioned = set()
+    intents_seen = set()
+    tools_called = set()
+
+    for turn in turn_list:
+        content_lower = (turn.content or "").lower()
+        for product in _CATALOG_PRODUCTS:
+            if product.lower() in content_lower:
+                products_mentioned.add(product)
+
+        intent = getattr(turn, "intent", None)
+        if intent:
+            intents_seen.add(intent)
+
+        tool_calls_raw = getattr(turn, "tool_calls", None)
+        if tool_calls_raw:
+            try:
+                tool_list = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
+                if isinstance(tool_list, list):
+                    for tc in tool_list:
+                        if isinstance(tc, dict) and tc.get("tool"):
+                            tools_called.add(tc["tool"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    context_lines = ["\n=== Active Context ==="]
+    if products_mentioned:
+        context_lines.append(f"Products discussed: {', '.join(sorted(products_mentioned))}")
+    if intents_seen:
+        context_lines.append(f"Intents: {', '.join(sorted(intents_seen))}")
+    if tools_called:
+        context_lines.append(f"Tools used: {', '.join(sorted(tools_called))}")
+    if not products_mentioned and not intents_seen and not tools_called:
+        context_lines.append("(new conversation)")
+
+    # ── Section 3: Latest Exchange (full detail) ─────────────────
+    latest_lines = ["\n=== Latest Exchange ==="]
+    # Walk backwards to find the last user+assistant pair
+    last_user = None
+    last_assistant = None
+    for turn in reversed(list(turns)):
+        if turn.role == "assistant" and last_assistant is None:
+            last_assistant = turn
+        elif turn.role == "user" and last_user is None:
+            last_user = turn
+        if last_user and last_assistant:
+            break
+
+    if last_user:
+        latest_lines.append(f"User: {last_user.content}")
+    if last_assistant:
+        intent = getattr(last_assistant, "intent", None)
+        intent_tag = f" [intent: {intent}]" if intent else ""
+        latest_lines.append(f"Assistant{intent_tag}: {last_assistant.content}")
+
+    return "\n".join(flow_lines + context_lines + latest_lines)
 
 
 def _strip_llm_json(text: str) -> str:
@@ -327,11 +514,17 @@ def _strip_llm_json(text: str) -> str:
 class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
 
     @grpc_retry
-    def _classify_intent(self, query: str, context: str):
+    def _classify_intent(self, query: str, context: str,
+                         previous_intent: str = "", previous_entities: str = ""):
         """Classify user intent using the LLM."""
         llm_stub = get_llm_stub()
 
-        prompt = INTENT_CLASSIFICATION_PROMPT.format(context=context, query=query)
+        prompt = INTENT_CLASSIFICATION_PROMPT.format(
+            context=context,
+            query=query,
+            previous_intent=previous_intent or "none",
+            previous_entities=previous_entities or "none",
+        )
         response = llm_stub.GenerateAnswer(llm_pb2.LLMRequest(
             prompt=prompt,
             system_prompt="You are an intent classifier. Respond with valid JSON only.",
@@ -347,6 +540,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             return {
                 "intent": "general_question",
                 "confidence": 0.5,
+                "domain_relevance": 0.5,
                 "entities": [],
                 "needs_clarification": False,
                 "clarification_question": "",
@@ -454,7 +648,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
 
     @grpc_retry
     def _execute_react_step(self, query, memory_context, tool_descriptions, react_history,
-                            reflexion_context=""):
+                            reflexion_context="", intent=""):
         """Execute one iteration of the ReACT loop via LLM."""
         llm_stub = get_llm_stub()
 
@@ -466,6 +660,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             memory_context=memory_context,
             query=query,
             react_history=react_history,
+            intent=intent or "general",
         )
 
         response = llm_stub.GenerateAnswer(llm_pb2.LLMRequest(
@@ -489,7 +684,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
         return response
 
     @grpc_retry
-    def _frame_response(self, query, answer, tools_used, reasoning_steps):
+    def _frame_response(self, query, answer, tools_used, reasoning_steps, memory_context=""):
         """Frame the final response with confidence and sources."""
         llm_stub = get_llm_stub()
 
@@ -498,6 +693,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             answer=answer,
             tools_used=", ".join(tools_used) if tools_used else "none",
             reasoning_steps=reasoning_steps,
+            memory_context=memory_context[:800] if memory_context else "No previous conversation.",
         )
 
         response = llm_stub.GenerateAnswer(llm_pb2.LLMRequest(
@@ -551,7 +747,8 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             }
 
     @grpc_retry
-    def _refine_response(self, query, response_text, tools_used, evaluation, observations):
+    def _refine_response(self, query, response_text, tools_used, evaluation, observations,
+                         memory_context=""):
         """LLM call to produce an improved response based on critique."""
         llm_stub = get_llm_stub()
 
@@ -564,6 +761,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
                 "suggestions": evaluation.get("suggestions", []),
             }),
             observations=observations[:1000],
+            memory_context=memory_context[:500] if memory_context else "No previous conversation.",
         )
 
         response = llm_stub.GenerateAnswer(llm_pb2.LLMRequest(
@@ -638,7 +836,8 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             ))
 
             refined = self._refine_response(
-                query, current["text"], tools_used, evaluation, observations
+                query, current["text"], tools_used, evaluation, observations,
+                memory_context=memory_context,
             )
 
             if refined is not None:
@@ -908,6 +1107,60 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
                  intent=intent, confidence=confidence,
                  latency_ms=int(latency_seconds * 1000))
 
+    # ── Query Rewriting (Conversational Context Resolution) ─────
+
+    @grpc_retry
+    def _rewrite_query(self, query, history_turns):
+        """Rewrite a follow-up query to be self-contained using LLM intelligence.
+
+        Takes the raw user query and conversation history, produces a resolved
+        query with all pronouns and references replaced by explicit names.
+        This resolved query is what flows through the rest of the pipeline,
+        ensuring tools, framing, and reflection all work with unambiguous input.
+
+        Returns the original query unchanged if there is no history or on error.
+        """
+        if not history_turns:
+            return query
+
+        # Build a compact history string for the rewriter
+        history_lines = []
+        for turn in history_turns[-(Config.MEMORY_CONTEXT_MAX_TURNS):]:
+            role = "User" if turn.role == "user" else "Assistant"
+            content = turn.content or ""
+            # Truncate older turns to keep the rewrite prompt focused
+            if len(content) > 300:
+                content = content[:300] + "..."
+            history_lines.append(f"{role}: {content}")
+
+        history_text = "\n".join(history_lines)
+
+        llm_stub = get_llm_stub()
+        prompt = QUERY_REWRITE_PROMPT.format(history=history_text, query=query)
+
+        response = llm_stub.GenerateAnswer(llm_pb2.LLMRequest(
+            prompt=prompt,
+            system_prompt="You are a query rewriter. Return ONLY the rewritten query, nothing else.",
+            temperature=Config.QUERY_REWRITE_TEMPERATURE,
+            max_tokens=Config.QUERY_REWRITE_MAX_TOKENS,
+        ))
+
+        rewritten = (response.completion or "").strip()
+
+        # Sanity checks: the rewriter should return a non-empty, reasonable query
+        # Use a floor of 200 chars so short follow-ups like "Compare this" (12 chars)
+        # can still be rewritten to include full product names.
+        max_rewrite_len = max(len(query) * 5, 200)
+        if not rewritten or len(rewritten) > max_rewrite_len:
+            log.warning("query_rewrite_sanity_failed",
+                        original=query, rewritten=rewritten[:200] if rewritten else "")
+            return query
+
+        if rewritten != query:
+            log.info("query_rewritten", original=query, rewritten=rewritten)
+
+        return rewritten
+
     # ── Multi-Agent Orchestration ────────────────────────────────
 
     def _run_agent_sub_loop(self, agent_type, query, memory_context,
@@ -936,6 +1189,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
                 memory_context=memory_context,
                 query=query,
                 react_history=react_history,
+                intent=agent_type,
             )
 
             llm_stub = get_llm_stub()
@@ -1094,7 +1348,8 @@ Provide a unified, well-structured response that combines all the specialist fin
         # Frame the synthesized response
         all_steps = []  # Combined steps placeholder
         try:
-            framed = self._frame_response(query, synthesized, all_tools_used, len(results))
+            framed = self._frame_response(query, synthesized, all_tools_used, len(results),
+                                          memory_context=memory_context)
         except Exception:
             framed = {"text": synthesized, "confidence": 0.7, "sources": []}
 
@@ -1201,16 +1456,34 @@ Provide a unified, well-structured response that combines all the specialist fin
             log.warning("touch_session_failed", error=str(e))
 
         # Get conversation history
+        history_turns = []
         try:
             history_resp = memory_stub.GetConversationHistory(
                 memory_pb2.GetHistoryRequest(session_id=session_id, limit=10)
             )
-            memory_context = build_memory_context(history_resp.turns)
-            context_turns = [t.content for t in history_resp.turns[-6:]]
+            history_turns = list(history_resp.turns)
+            memory_context = build_memory_context(history_turns)
         except Exception as e:
             log.warning("get_history_failed", error=str(e))
             memory_context = "No previous conversation."
-            context_turns = []
+
+        # Extract previous assistant turn's intent and tool_calls for follow-up detection
+        previous_intent = ""
+        previous_entities = ""
+        for turn in reversed(history_turns):
+            if turn.role == "assistant":
+                previous_intent = getattr(turn, "intent", "") or ""
+                tool_calls_raw = getattr(turn, "tool_calls", "") or ""
+                if tool_calls_raw:
+                    try:
+                        tool_list = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
+                        if isinstance(tool_list, list):
+                            previous_entities = ", ".join(
+                                tc.get("tool", "") for tc in tool_list if isinstance(tc, dict)
+                            )
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                break
 
         # Store user turn
         try:
@@ -1240,22 +1513,75 @@ Provide a unified, well-structured response that combines all the specialist fin
                 log.warning("pii_detected_in_input", pii_types=pii_warnings[0].get("pii_types", []))
             query = sanitized_query  # use sanitized version going forward
 
+        # ── Step 0.7: Query Rewriting ─────────────────────────────
+        # Resolve pronouns/references using LLM before any downstream processing.
+        # The rewritten query is what flows through intent classification, planning,
+        # ReACT, framing, and reflection — ensuring all stages see explicit names.
+        if Config.QUERY_REWRITE_ENABLED and history_turns:
+            try:
+                query = self._rewrite_query(query, history_turns)
+            except Exception as e:
+                log.warning("query_rewrite_failed", error=str(e))
+                # Continue with original query on failure
+
         # ── Step 1: Intent Classification ─────────────────────────
-        intent_result = self._classify_intent(query, memory_context)
+        intent_result = self._classify_intent(
+            query, memory_context,
+            previous_intent=previous_intent,
+            previous_entities=previous_entities,
+        )
         intent = intent_result.get("intent", "general_question")
         confidence = intent_result.get("confidence", 0.5)
+        domain_relevance = intent_result.get("domain_relevance", 0.5)
 
-        log.info("intent_classified", intent=intent, confidence=confidence)
+        log.info("intent_classified", intent=intent, confidence=confidence,
+                 domain_relevance=domain_relevance)
 
-        # ── Step 2: Check if clarification needed ─────────────────
-        if intent_result.get("needs_clarification") and confidence < Config.INTENT_CONFIDENCE_THRESHOLD:
+        # ── Step 2: Decision routing ─────────────────────────────
+
+        # Path 0: Session query → answer from conversation history
+        if intent == "session_query":
+            log.info("session_query_detected")
+            yield from self._handle_session_query(
+                session_id, customer_id, query, history_turns, memory_stub
+            )
+            return
+
+        # Path A: Low domain relevance → catalog-aware redirect
+        if domain_relevance < Config.DOMAIN_RELEVANCE_THRESHOLD:
+            log.info("low_domain_relevance_redirect", domain_relevance=domain_relevance)
+            yield from self._handle_out_of_scope_redirect(
+                session_id, customer_id, query, memory_stub
+            )
+            return
+
+        # Path B: High domain relevance + low confidence → clarification
+        # follow_up intent must NEVER trigger clarification
+        if (intent_result.get("needs_clarification")
+                and confidence < Config.INTENT_CONFIDENCE_THRESHOLD
+                and intent != "follow_up"):
+            clarification_question = intent_result.get("clarification_question", "Could you provide more details?")
+            # Store the clarification turn before yielding (Fix C)
+            try:
+                memory_stub.AddConversationTurn(memory_pb2.AddTurnRequest(
+                    session_id=session_id,
+                    role="assistant",
+                    content=clarification_question,
+                    intent="clarification",
+                    confidence=confidence,
+                ))
+            except Exception as e:
+                log.warning("store_clarification_turn_failed", error=str(e))
+
             clarification_payload = json.dumps({
-                "message": intent_result.get("clarification_question", "Could you provide more details?"),
+                "message": clarification_question,
                 "options": self._build_clarification_options(intent_result),
                 "allow_freetext": True,
             })
             yield agent_pb2.AgentEvent(type="clarification", payload=clarification_payload)
             return
+
+        # Path C: Proceed normally (high domain relevance + high confidence)
 
         # ── Step 2.5: Planning Layer ──────────────────────────────
         plan = None
@@ -1319,19 +1645,129 @@ Provide a unified, well-structured response that combines all the specialist fin
             )
 
     def _build_clarification_options(self, intent_result):
-        """Build clarification options based on possible intents."""
+        """Build dynamic clarification options based on query context."""
+        entities = intent_result.get("entities", [])
+        intent = intent_result.get("intent", "general_question")
+
+        # Category-specific options when entities hint at a product domain
+        category_options = {
+            "cleaning": [
+                {"label": "Robot vacuum (RoboCleaner)", "value": "product_inquiry:RoboCleaner"},
+                {"label": "Vacuum cleaner (SuperVac)", "value": "product_inquiry:SuperVac"},
+                {"label": "Washing machine (UltraWasher)", "value": "product_inquiry:UltraWasher"},
+            ],
+            "kitchen": [
+                {"label": "Blender (MegaBlender)", "value": "product_inquiry:MegaBlender"},
+                {"label": "Electric kettle (EcoKettle)", "value": "product_inquiry:EcoKettle"},
+            ],
+            "smart_home": [
+                {"label": "Smart lighting (SmartLamp)", "value": "product_inquiry:SmartLamp"},
+                {"label": "Air purifier (AirPurifier)", "value": "product_inquiry:AirPurifier"},
+                {"label": "Noise canceller (NoiseCanceller)", "value": "product_inquiry:NoiseCanceller"},
+            ],
+        }
+
+        # Check if entities match any category keywords (word-boundary matching)
+        entity_text = " ".join(entities).lower()
+        cleaning_keywords = {"clean", "vacuum", "wash", "mop", "floor", "dust"}
+        kitchen_keywords = {"blend", "cook", "kitchen", "kettle", "boil", "smoothie", "mix"}
+        smart_keywords = {"smart", "lamp", "light", "air", "noise", "purif"}
+
+        def _has_keyword(text, keywords):
+            return any(re.search(r'\b' + kw, text) for kw in keywords)
+
+        if _has_keyword(entity_text, cleaning_keywords):
+            return category_options["cleaning"]
+        elif _has_keyword(entity_text, kitchen_keywords):
+            return category_options["kitchen"]
+        elif _has_keyword(entity_text, smart_keywords):
+            return category_options["smart_home"]
+
+        # Default: broad intent-based options
         options = [
-            {"label": "I'm looking for product recommendations", "value": "product_inquiry"},
-            {"label": "I want to compare prices", "value": "price_check"},
-            {"label": "I have a warranty question", "value": "warranty_question"},
-            {"label": "I want to compare products", "value": "comparison"},
+            {"label": "Find a product by category", "value": "product_inquiry"},
+            {"label": "Compare prices", "value": "price_check"},
+            {"label": "Check warranty coverage", "value": "warranty_question"},
+            {"label": "Compare two or more products", "value": "comparison"},
         ]
         return options
+
+    _OUT_OF_SCOPE_MESSAGE = (
+        "I'm Piper, your product support assistant. That doesn't seem to be related to our product catalog. "
+        "I specialize in home appliances and tools — here's what I can help you with:\n\n"
+        "• Washing machines (UltraWasher)\n"
+        "• Robot vacuums & vacuums (RoboCleaner, SuperVac)\n"
+        "• Kitchen appliances (MegaBlender, EcoKettle)\n"
+        "• Smart home (SmartLamp, AirPurifier, NoiseCanceller)\n"
+        "• Power tools (PowerDrill)\n"
+        "• Travel gear (ThermoBottle)\n\n"
+        "I can look up prices, compare products, or check warranty coverage. What would you like to know?"
+    )
+
+    def _handle_out_of_scope_redirect(self, session_id, customer_id, query, memory_stub):
+        """Handle queries with low domain relevance by providing a catalog-aware redirect."""
+        answer = self._OUT_OF_SCOPE_MESSAGE
+
+        # Output guardrails
+        if Config.GUARDRAILS_ENABLED:
+            sanitized_text, was_modified, redactions = self._check_output_guardrails(answer)
+            if was_modified:
+                answer = sanitized_text
+                yield agent_pb2.AgentEvent(
+                    type="guardrail_sanitized",
+                    payload=json.dumps({"redacted_types": redactions}),
+                )
+
+        # Stream tokens
+        for word in answer.split(" "):
+            yield agent_pb2.AgentEvent(type="token", payload=word + " ")
+
+        # Store assistant turn
+        try:
+            memory_stub.AddConversationTurn(memory_pb2.AddTurnRequest(
+                session_id=session_id,
+                role="assistant",
+                content=answer,
+                intent="out_of_scope",
+                confidence=1.0,
+            ))
+        except Exception as e:
+            log.warning("store_assistant_turn_failed", error=str(e))
+
+        # Get follow-up recommendations
+        recommendations = []
+        try:
+            rec_stub = get_rec_stub()
+            rec_response = rec_stub.GetFollowUpRecommendations(
+                rec_pb2.FollowUpRecommendationRequest(
+                    session_id=session_id,
+                    last_query=query,
+                    last_response=answer[:500],
+                    intent="out_of_scope",
+                    customer_id=customer_id,
+                )
+            )
+            recommendations = list(rec_response.suggestions)
+        except Exception as e:
+            log.warning("get_recommendations_failed", error=str(e))
+
+        # Response complete
+        complete_payload = json.dumps({
+            "response": {
+                "text": answer,
+                "confidence": 0.5,
+                "sources": [],
+                "reasoning_steps": 0,
+                "tools_used": [],
+            },
+            "recommendations": recommendations,
+        })
+        yield agent_pb2.AgentEvent(type="response_complete", payload=complete_payload)
 
     def _handle_simple_intent(self, session_id, customer_id, query, intent, memory_context, memory_stub):
         """Handle intents that don't require tool use."""
         if intent == "out_of_scope":
-            answer = "I'm Piper, your product support assistant. I can help you find products, compare prices, and check warranties. Is there something product-related I can help you with?"
+            answer = self._OUT_OF_SCOPE_MESSAGE
         else:
             try:
                 llm_stub = get_llm_stub()
@@ -1403,6 +1839,81 @@ Provide a unified, well-structured response that combines all the specialist fin
         })
         yield agent_pb2.AgentEvent(type="response_complete", payload=complete_payload)
 
+    def _handle_session_query(self, session_id, customer_id, query, history_turns, memory_stub):
+        """Handle meta/session queries by responding from conversation history."""
+        if not history_turns:
+            answer = "This is the start of our conversation — you haven't asked any questions yet!"
+        else:
+            user_queries = []
+            for turn in history_turns:
+                if turn.role == "user":
+                    user_queries.append(turn.content)
+
+            if not user_queries:
+                answer = "I don't see any previous questions in this session."
+            else:
+                lines = ["Here are the queries you've asked in this session:\n"]
+                for i, q in enumerate(user_queries, 1):
+                    lines.append(f"{i}. {q}")
+                answer = "\n".join(lines)
+
+        # Output guardrails
+        if Config.GUARDRAILS_ENABLED:
+            sanitized_text, was_modified, redactions = self._check_output_guardrails(answer)
+            if was_modified:
+                answer = sanitized_text
+                log.warning("output_pii_redacted", redactions=redactions)
+                yield agent_pb2.AgentEvent(
+                    type="guardrail_sanitized",
+                    payload=json.dumps({"redacted_types": redactions}),
+                )
+
+        # Stream tokens
+        for word in answer.split(" "):
+            yield agent_pb2.AgentEvent(type="token", payload=word + " ")
+
+        # Store assistant turn
+        try:
+            memory_stub.AddConversationTurn(memory_pb2.AddTurnRequest(
+                session_id=session_id,
+                role="assistant",
+                content=answer,
+                intent="session_query",
+                confidence=1.0,
+            ))
+        except Exception as e:
+            log.warning("store_assistant_turn_failed", error=str(e))
+
+        # Get follow-up recommendations
+        recommendations = []
+        try:
+            rec_stub = get_rec_stub()
+            rec_response = rec_stub.GetFollowUpRecommendations(
+                rec_pb2.FollowUpRecommendationRequest(
+                    session_id=session_id,
+                    last_query=query,
+                    last_response=answer[:500],
+                    intent="session_query",
+                    customer_id=customer_id,
+                )
+            )
+            recommendations = list(rec_response.suggestions)
+        except Exception as e:
+            log.warning("get_recommendations_failed", error=str(e))
+
+        # Response complete
+        complete_payload = json.dumps({
+            "response": {
+                "text": answer,
+                "confidence": 1.0,
+                "sources": [],
+                "reasoning_steps": 0,
+                "tools_used": [],
+            },
+            "recommendations": recommendations,
+        })
+        yield agent_pb2.AgentEvent(type="response_complete", payload=complete_payload)
+
     def _run_react_loop(self, session_id, customer_id, query, intent, memory_context,
                          memory_stub, start_time, plan=None, tool_descriptions=None,
                          available_tools=None, tool_schemas=None):
@@ -1448,6 +1959,7 @@ Provide a unified, well-structured response that combines all the specialist fin
             llm_output = self._execute_react_step(
                 query, memory_context, tool_descriptions, react_history,
                 reflexion_context=reflexion_context,
+                intent=intent,
             )
 
             thought, action, action_input, answer = parse_react_output(llm_output)
@@ -1549,7 +2061,8 @@ Provide a unified, well-structured response that combines all the specialist fin
 
         # ── Frame the response ────────────────────────────────────
         try:
-            framed = self._frame_response(query, final_answer, tools_used, len(steps))
+            framed = self._frame_response(query, final_answer, tools_used, len(steps),
+                                          memory_context=memory_context)
         except Exception:
             framed = {"text": final_answer, "confidence": 0.7, "sources": []}
 
@@ -1682,7 +2195,13 @@ Provide a unified, well-structured response that combines all the specialist fin
                 "warranty_question": "I have a warranty question",
                 "comparison": "I want to compare products",
             }
-            enriched_query = f"{last_query} — {intent_map.get(selected, selected)}"
+            # Handle dynamic options like "product_inquiry:RoboCleaner"
+            if ":" in selected:
+                base_intent, product_name = selected.split(":", 1)
+                base_phrase = intent_map.get(base_intent, base_intent)
+                enriched_query = f"{last_query} — {base_phrase} about {product_name}"
+            else:
+                enriched_query = f"{last_query} — {intent_map.get(selected, selected)}"
 
         # Get session info to extract customer_id
         try:
