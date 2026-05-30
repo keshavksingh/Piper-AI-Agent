@@ -7,8 +7,18 @@ from datetime import datetime
 
 import grpc
 import pytest
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
 
 from memory_service.server import MemoryServiceServicer, _session_key, _turns_key
+
+
+def _make_struct(d):
+    """Build a protobuf Struct from a dict."""
+    s = Struct()
+    if d:
+        json_format.ParseDict(d, s)
+    return s
 
 
 @pytest.fixture
@@ -29,8 +39,9 @@ class TestCreateSession:
 
     @patch("memory_service.server.get_ts_conn")
     @patch("memory_service.server.get_pg_conn")
-    @patch("memory_service.server.redis_client")
-    def test_creates_session(self, mock_redis, mock_pg, mock_ts, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_creates_session(self, mock_get_redis, mock_pg, mock_ts, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         conn = MagicMock()
         cursor = MagicMock()
         conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
@@ -56,8 +67,9 @@ class TestCreateSession:
 
     @patch("memory_service.server.get_ts_conn")
     @patch("memory_service.server.get_pg_conn")
-    @patch("memory_service.server.redis_client")
-    def test_stores_in_redis(self, mock_redis, mock_pg, mock_ts, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_stores_in_redis(self, mock_get_redis, mock_pg, mock_ts, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         conn = MagicMock()
         cursor = MagicMock()
         conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
@@ -79,8 +91,9 @@ class TestCreateSession:
 class TestGetSession:
     """Tests for GetSession."""
 
-    @patch("memory_service.server.redis_client")
-    def test_cache_hit(self, mock_redis, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_cache_hit(self, mock_get_redis, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         cached_data = json.dumps({
             "session_id": "sess-1",
             "customer_id": "cust-1",
@@ -98,8 +111,9 @@ class TestGetSession:
         assert response.is_new is False
 
     @patch("memory_service.server.get_pg_conn")
-    @patch("memory_service.server.redis_client")
-    def test_cache_miss_pg_fallback(self, mock_redis, mock_pg, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_cache_miss_pg_fallback(self, mock_get_redis, mock_pg, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         mock_redis.get.return_value = None
 
         conn = MagicMock()
@@ -124,8 +138,9 @@ class TestGetSession:
         mock_redis.setex.assert_called_once()
 
     @patch("memory_service.server.get_pg_conn")
-    @patch("memory_service.server.redis_client")
-    def test_not_found(self, mock_redis, mock_pg, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_not_found(self, mock_get_redis, mock_pg, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         mock_redis.get.return_value = None
 
         conn = MagicMock()
@@ -146,8 +161,9 @@ class TestTouchSession:
     """Tests for TouchSession."""
 
     @patch("memory_service.server.get_pg_conn")
-    @patch("memory_service.server.redis_client")
-    def test_refreshes_ttl(self, mock_redis, mock_pg, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_refreshes_ttl(self, mock_get_redis, mock_pg, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         conn = MagicMock()
         cursor = MagicMock()
         conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
@@ -174,8 +190,9 @@ class TestAddConversationTurn:
     """Tests for AddConversationTurn."""
 
     @patch("memory_service.server.get_pg_conn")
-    @patch("memory_service.server.redis_client")
-    def test_stores_in_pg_and_redis(self, mock_redis, mock_pg, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_stores_in_pg_and_redis(self, mock_get_redis, mock_pg, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         conn = MagicMock()
         cursor = MagicMock()
         conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
@@ -188,7 +205,7 @@ class TestAddConversationTurn:
         request.content = "Hello"
         request.intent = "general_question"
         request.confidence = 0.9
-        request.tool_calls = ""
+        request.tool_calls = []
 
         response = servicer.AddConversationTurn(request, mock_context)
         assert len(response.turn_id) == 36
@@ -200,8 +217,9 @@ class TestAddConversationTurn:
 class TestGetConversationHistory:
     """Tests for GetConversationHistory."""
 
-    @patch("memory_service.server.redis_client")
-    def test_cache_hit(self, mock_redis, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_cache_hit(self, mock_get_redis, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         turns = [
             json.dumps({"role": "user", "content": "Hi", "intent": "", "confidence": 0.0, "tool_calls": "", "created_at": "2024-01-01"}),
             json.dumps({"role": "assistant", "content": "Hello!", "intent": "", "confidence": 0.0, "tool_calls": "", "created_at": "2024-01-01"}),
@@ -217,8 +235,9 @@ class TestGetConversationHistory:
         assert response.turns[0].role == "user"
 
     @patch("memory_service.server.get_pg_conn")
-    @patch("memory_service.server.redis_client")
-    def test_cache_miss(self, mock_redis, mock_pg, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_cache_miss(self, mock_get_redis, mock_pg, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         mock_redis.lrange.return_value = []
 
         conn = MagicMock()
@@ -238,8 +257,9 @@ class TestGetConversationHistory:
         response = servicer.GetConversationHistory(request, mock_context)
         assert len(response.turns) == 1
 
-    @patch("memory_service.server.redis_client")
-    def test_limit_applied(self, mock_redis, servicer, mock_context):
+    @patch("memory_service.server._get_redis")
+    def test_limit_applied(self, mock_get_redis, servicer, mock_context):
+        mock_redis = mock_get_redis.return_value
         turns = [json.dumps({"role": "user", "content": f"msg{i}", "intent": "", "confidence": 0.0, "tool_calls": "", "created_at": ""}) for i in range(10)]
         mock_redis.lrange.return_value = turns
 
@@ -269,7 +289,7 @@ class TestStoreEpisodicMemory:
         request.summary = "User asked about widgets"
         request.key_topics = ["widgets"]
         request.resolution_status = "resolved"
-        request.metadata = "{}"
+        request.metadata = _make_struct({})
 
         response = servicer.StoreEpisodicMemory(request, mock_context)
         assert len(response.memory_id) == 36
@@ -339,7 +359,7 @@ class TestAudit:
         request.session_id = "sess-1"
         request.customer_id = "cust-1"
         request.event_type = "session_created"
-        request.event_data = "{}"
+        request.event_data = _make_struct({})
 
         response = servicer.AppendAuditEvent(request, mock_context)
         assert len(response.event_id) == 36

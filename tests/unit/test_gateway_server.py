@@ -280,7 +280,9 @@ async def test_ws_user_message_flow(mock_mem, mock_rec, mock_agent):
 
             # Send user message
             ws.send_text(json.dumps({"type": "user_message", "text": "Hello"}))
-            # Should receive the streamed events
+            # Should receive processing_started, then streamed events
+            resp_ps = json.loads(ws.receive_text())
+            assert resp_ps["type"] == "processing_started"
             resp1 = json.loads(ws.receive_text())
             assert resp1["type"] == "token"
             resp2 = json.loads(ws.receive_text())

@@ -134,12 +134,19 @@ class TestBuildReactHistory:
 class TestBuildMemoryContext:
     """Tests for build_memory_context."""
 
+    class _MockToolCall:
+        """Lightweight mock for memory_pb2.ToolCall."""
+        def __init__(self, tool_name):
+            self.tool_name = tool_name
+            self.arguments = MagicMock(fields={})
+            self.result = ""
+
     class Turn:
         def __init__(self, role, content, intent=None, tool_calls=None, created_at=None):
             self.role = role
             self.content = content
             self.intent = intent
-            self.tool_calls = tool_calls
+            self.tool_calls = tool_calls or []
             self.created_at = created_at
 
     def test_empty_turns(self):
@@ -216,7 +223,7 @@ class TestBuildMemoryContext:
             self.Turn("user", "Search for products"),
             self.Turn("assistant", "Found results.",
                       intent="product_inquiry",
-                      tool_calls=json.dumps([{"tool": "product_search"}, {"tool": "price_lookup"}])),
+                      tool_calls=[self._MockToolCall("product_search"), self._MockToolCall("price_lookup")]),
         ]
         result = build_memory_context(turns)
         assert "Tools used:" in result

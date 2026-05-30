@@ -23,11 +23,19 @@ import protos.tool_service_pb2_grpc as tool_pb2_grpc
 import protos.recommendation_service_pb2 as rec_pb2
 import protos.recommendation_service_pb2_grpc as rec_pb2_grpc
 
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
+
 from shared.config import Config
 from shared.logging_config import setup_logging
 from shared.resilience import create_grpc_channel, grpc_retry
 
 log = setup_logging("agent_service")
+
+
+def _build_tool_call_protos(tools_used):
+    """Build a list of memory_pb2.ToolCall messages from a list of tool names."""
+    return [memory_pb2.ToolCall(tool_name=t) for t in tools_used]
 
 # ── gRPC Stubs (cached channels to prevent resource leaks) ───────
 
@@ -457,16 +465,11 @@ def build_memory_context(turns) -> str:
         if intent:
             intents_seen.add(intent)
 
-        tool_calls_raw = getattr(turn, "tool_calls", None)
-        if tool_calls_raw:
-            try:
-                tool_list = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
-                if isinstance(tool_list, list):
-                    for tc in tool_list:
-                        if isinstance(tc, dict) and tc.get("tool"):
-                            tools_called.add(tc["tool"])
-            except (json.JSONDecodeError, TypeError):
-                pass
+        # tool_calls is now repeated ToolCall messages
+        tc_list = list(turn.tool_calls) if turn.tool_calls else []
+        for tc in tc_list:
+            if tc.tool_name:
+                tools_called.add(tc.tool_name)
 
     context_lines = ["\n=== Active Context ==="]
     if products_mentioned:
@@ -530,7 +533,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt="You are an intent classifier. Respond with valid JSON only.",
             temperature=Config.INTENT_TEMPERATURE,
             max_tokens=Config.INTENT_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         try:
             result = json.loads(_strip_llm_json(response.completion))
@@ -552,18 +555,20 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
     def _get_tool_descriptions(self):
         """Fetch available tools from Tool Service, including parameter schemas."""
         tool_stub = get_tool_stub()
-        response = tool_stub.ListTools(tool_pb2.ListToolsRequest())
+        response = tool_stub.ListTools(tool_pb2.ListToolsRequest(), timeout=Config.GRPC_TIMEOUT_TOOL)
         descriptions = []
         tool_schemas = {}
         for tool in response.tools:
-            schema_str = tool.parameter_schema
+            # parameter_schema is now a Struct — convert to dict for display and validation
+            if tool.parameter_schema.fields:
+                schema_dict = json_format.MessageToDict(tool.parameter_schema)
+            else:
+                schema_dict = {}
+            schema_str = json.dumps(schema_dict) if schema_dict else "{}"
             descriptions.append(
                 f"- {tool.name}: {tool.description}\n  Parameters: {schema_str}"
             )
-            try:
-                tool_schemas[tool.name] = json.loads(schema_str)
-            except (json.JSONDecodeError, TypeError):
-                tool_schemas[tool.name] = {}
+            tool_schemas[tool.name] = schema_dict
         return "\n".join(descriptions), [t.name for t in response.tools], tool_schemas
 
     # ── Structured Tool Validation ───────────────────────────────
@@ -668,7 +673,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt=system,
             temperature=Config.DEFAULT_TEMPERATURE,
             max_tokens=Config.DEFAULT_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         return response.completion
 
@@ -676,11 +681,19 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
     def _execute_tool(self, session_id, tool_name, params_json):
         """Execute a tool via Tool Service."""
         tool_stub = get_tool_stub()
+        # Build Struct parameters from JSON string
+        params_struct = Struct()
+        try:
+            params_dict = json.loads(params_json) if isinstance(params_json, str) else (params_json or {})
+            if isinstance(params_dict, dict) and params_dict:
+                json_format.ParseDict(params_dict, params_struct)
+        except (json.JSONDecodeError, TypeError):
+            pass
         response = tool_stub.ExecuteTool(tool_pb2.ExecuteToolRequest(
             session_id=session_id,
             tool_name=tool_name,
-            parameters=params_json,
-        ))
+            parameters=params_struct,
+        ), timeout=Config.GRPC_TIMEOUT_TOOL)
         return response
 
     @grpc_retry
@@ -701,7 +714,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt="You are a response formatter. Respond with valid JSON only.",
             temperature=0.2,
             max_tokens=Config.DEFAULT_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         try:
             return json.loads(_strip_llm_json(response.completion))
@@ -732,7 +745,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt="You are a quality evaluator. Respond with valid JSON only.",
             temperature=Config.REFLECTION_TEMPERATURE,
             max_tokens=Config.REFLECTION_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         try:
             return json.loads(_strip_llm_json(response.completion))
@@ -769,7 +782,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt="You are a response refiner. Respond with valid JSON only.",
             temperature=Config.REFLECTION_TEMPERATURE,
             max_tokens=Config.DEFAULT_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         try:
             return json.loads(_strip_llm_json(response.completion))
@@ -866,7 +879,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
                 customer_id=customer_id,
                 limit=5,
                 event_type="reflexion_insight",
-            ))
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
 
             if not response.memories:
                 return ""
@@ -875,10 +888,10 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             query_terms = set(query.lower().split())
             relevant = []
             for mem in response.memories:
-                # Match by intent in metadata
+                # Match by intent in metadata (now a Struct)
                 try:
-                    meta = json.loads(mem.metadata) if mem.metadata else {}
-                except json.JSONDecodeError:
+                    meta = json_format.MessageToDict(mem.metadata) if mem.metadata.fields else {}
+                except Exception:
                     meta = {}
 
                 mem_intent = meta.get("intent", "")
@@ -927,7 +940,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt="You are a self-reflection agent. Respond with valid JSON only.",
             temperature=Config.REFLECTION_TEMPERATURE,
             max_tokens=Config.REFLECTION_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         try:
             return json.loads(_strip_llm_json(response.completion))
@@ -961,7 +974,8 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             if not summary:
                 summary = insight.get("failure_reason", "Unspecified learning")
 
-            metadata = json.dumps({
+            metadata_struct = Struct()
+            json_format.ParseDict({
                 "query_pattern": insight.get("query_pattern", ""),
                 "intent": intent,
                 "failure_reason": insight.get("failure_reason", ""),
@@ -969,7 +983,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
                 "original_score": original_score,
                 "refined_score": refined_score,
                 "tools_used": tools_used,
-            })
+            }, metadata_struct)
 
             refinement_helped = (refined_score or 0) > (original_score or 0)
 
@@ -980,8 +994,8 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
                 summary=summary,
                 key_topics=insight.get("key_topics", []),
                 resolution_status="resolved" if refinement_helped else "unresolved",
-                metadata=metadata,
-            ))
+                metadata=metadata_struct,
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
 
             log.info("reflexion_insight_stored",
                      original_score=original_score,
@@ -1016,7 +1030,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt="You are a planning agent. Respond with valid JSON only.",
             temperature=Config.PLANNING_TEMPERATURE,
             max_tokens=Config.PLANNING_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         try:
             plan = json.loads(_strip_llm_json(response.completion))
@@ -1082,7 +1096,8 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
         """Store structured evaluation data to TimescaleDB via episodic memory."""
         memory_stub = get_memory_stub()
 
-        payload = json.dumps({
+        metadata_struct = Struct()
+        json_format.ParseDict({
             "query": query,
             "intent": intent,
             "confidence": confidence,
@@ -1091,7 +1106,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             "reasoning_steps": len(steps),
             "latency_ms": int(latency_seconds * 1000),
             "response_length": len(response_text),
-        })
+        }, metadata_struct)
 
         memory_stub.StoreEpisodicMemory(memory_pb2.StoreEpisodicRequest(
             customer_id=customer_id,
@@ -1100,8 +1115,8 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             summary=f"Evaluation: intent={intent}, confidence={confidence:.2f}, latency={int(latency_seconds * 1000)}ms",
             key_topics=[intent] + tools_used,
             resolution_status="resolved",
-            metadata=payload,
-        ))
+            metadata=metadata_struct,
+        ), timeout=Config.GRPC_TIMEOUT_MEMORY)
 
         log.info("evaluation_record_stored",
                  intent=intent, confidence=confidence,
@@ -1143,7 +1158,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
             system_prompt="You are a query rewriter. Return ONLY the rewritten query, nothing else.",
             temperature=Config.QUERY_REWRITE_TEMPERATURE,
             max_tokens=Config.QUERY_REWRITE_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         rewritten = (response.completion or "").strip()
 
@@ -1198,7 +1213,7 @@ class AgentServiceServicer(agent_pb2_grpc.AgentServiceServicer):
                 system_prompt=system,
                 temperature=Config.DEFAULT_TEMPERATURE,
                 max_tokens=Config.DEFAULT_MAX_TOKENS,
-            ))
+            ), timeout=Config.GRPC_TIMEOUT_LLM)
 
             thought, action, action_input, answer = parse_react_output(response.completion)
 
@@ -1284,7 +1299,7 @@ Provide a unified, well-structured response that combines all the specialist fin
             system_prompt="You are a response synthesizer. Combine specialist outputs into a clear, unified answer.",
             temperature=0.3,
             max_tokens=Config.DEFAULT_MAX_TOKENS,
-        ))
+        ), timeout=Config.GRPC_TIMEOUT_LLM)
 
         return response.completion
 
@@ -1388,8 +1403,8 @@ Provide a unified, well-structured response that combines all the specialist fin
                 content=framed["text"],
                 intent=intent,
                 confidence=framed.get("confidence", 0.7),
-                tool_calls=json.dumps([{"tool": t} for t in all_tools_used]),
-            ))
+                tool_calls=_build_tool_call_protos(all_tools_used),
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
         except Exception as e:
             log.warning("store_assistant_turn_failed", error=str(e))
 
@@ -1417,7 +1432,8 @@ Provide a unified, well-structured response that combines all the specialist fin
                     last_response=framed["text"][:500],
                     intent=intent,
                     customer_id=customer_id,
-                )
+                ),
+                timeout=Config.GRPC_TIMEOUT_RECOMMENDATION,
             )
             recommendations = list(rec_response.suggestions)
         except Exception as e:
@@ -1451,7 +1467,10 @@ Provide a unified, well-structured response that combines all the specialist fin
 
         # Touch session (refresh TTL)
         try:
-            memory_stub.TouchSession(memory_pb2.TouchSessionRequest(session_id=session_id))
+            memory_stub.TouchSession(
+                memory_pb2.TouchSessionRequest(session_id=session_id),
+                timeout=Config.GRPC_TIMEOUT_MEMORY,
+            )
         except Exception as e:
             log.warning("touch_session_failed", error=str(e))
 
@@ -1459,7 +1478,8 @@ Provide a unified, well-structured response that combines all the specialist fin
         history_turns = []
         try:
             history_resp = memory_stub.GetConversationHistory(
-                memory_pb2.GetHistoryRequest(session_id=session_id, limit=10)
+                memory_pb2.GetHistoryRequest(session_id=session_id, limit=10),
+                timeout=Config.GRPC_TIMEOUT_MEMORY,
             )
             history_turns = list(history_resp.turns)
             memory_context = build_memory_context(history_turns)
@@ -1473,16 +1493,10 @@ Provide a unified, well-structured response that combines all the specialist fin
         for turn in reversed(history_turns):
             if turn.role == "assistant":
                 previous_intent = getattr(turn, "intent", "") or ""
-                tool_calls_raw = getattr(turn, "tool_calls", "") or ""
-                if tool_calls_raw:
-                    try:
-                        tool_list = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
-                        if isinstance(tool_list, list):
-                            previous_entities = ", ".join(
-                                tc.get("tool", "") for tc in tool_list if isinstance(tc, dict)
-                            )
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                # tool_calls is now repeated ToolCall messages
+                tc_list = list(turn.tool_calls) if turn.tool_calls else []
+                if tc_list:
+                    previous_entities = ", ".join(tc.tool_name for tc in tc_list if tc.tool_name)
                 break
 
         # Store user turn
@@ -1491,7 +1505,7 @@ Provide a unified, well-structured response that combines all the specialist fin
                 session_id=session_id,
                 role="user",
                 content=query,
-            ))
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
         except Exception as e:
             log.warning("store_turn_failed", error=str(e))
 
@@ -1569,7 +1583,7 @@ Provide a unified, well-structured response that combines all the specialist fin
                     content=clarification_question,
                     intent="clarification",
                     confidence=confidence,
-                ))
+                ), timeout=Config.GRPC_TIMEOUT_MEMORY)
             except Exception as e:
                 log.warning("store_clarification_turn_failed", error=str(e))
 
@@ -1730,7 +1744,7 @@ Provide a unified, well-structured response that combines all the specialist fin
                 content=answer,
                 intent="out_of_scope",
                 confidence=1.0,
-            ))
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
         except Exception as e:
             log.warning("store_assistant_turn_failed", error=str(e))
 
@@ -1745,7 +1759,8 @@ Provide a unified, well-structured response that combines all the specialist fin
                     last_response=answer[:500],
                     intent="out_of_scope",
                     customer_id=customer_id,
-                )
+                ),
+                timeout=Config.GRPC_TIMEOUT_RECOMMENDATION,
             )
             recommendations = list(rec_response.suggestions)
         except Exception as e:
@@ -1776,7 +1791,7 @@ Provide a unified, well-structured response that combines all the specialist fin
                     system_prompt="You are Piper, a friendly customer support assistant for a product catalog. Respond helpfully and concisely.",
                     temperature=0.5,
                     max_tokens=512,
-                ))
+                ), timeout=Config.GRPC_TIMEOUT_LLM)
                 answer = response.completion or "I'm sorry, I couldn't generate a response right now. Please try again."
             except Exception as e:
                 log.error("simple_intent_llm_failed", error=str(e), intent=intent)
@@ -1805,7 +1820,7 @@ Provide a unified, well-structured response that combines all the specialist fin
                 content=answer,
                 intent=intent,
                 confidence=1.0,
-            ))
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
         except Exception as e:
             log.warning("store_assistant_turn_failed", error=str(e))
 
@@ -1820,7 +1835,8 @@ Provide a unified, well-structured response that combines all the specialist fin
                     last_response=answer[:500],
                     intent=intent,
                     customer_id=customer_id,
-                )
+                ),
+                timeout=Config.GRPC_TIMEOUT_RECOMMENDATION,
             )
             recommendations = list(rec_response.suggestions)
         except Exception as e:
@@ -1880,7 +1896,7 @@ Provide a unified, well-structured response that combines all the specialist fin
                 content=answer,
                 intent="session_query",
                 confidence=1.0,
-            ))
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
         except Exception as e:
             log.warning("store_assistant_turn_failed", error=str(e))
 
@@ -1895,7 +1911,8 @@ Provide a unified, well-structured response that combines all the specialist fin
                     last_response=answer[:500],
                     intent="session_query",
                     customer_id=customer_id,
-                )
+                ),
+                timeout=Config.GRPC_TIMEOUT_RECOMMENDATION,
             )
             recommendations = list(rec_response.suggestions)
         except Exception as e:
@@ -2104,8 +2121,8 @@ Provide a unified, well-structured response that combines all the specialist fin
                 content=framed["text"],
                 intent=intent,
                 confidence=framed.get("confidence", 0.7),
-                tool_calls=json.dumps([{"tool": t} for t in tools_used]),
-            ))
+                tool_calls=_build_tool_call_protos(tools_used),
+            ), timeout=Config.GRPC_TIMEOUT_MEMORY)
         except Exception as e:
             log.warning("store_assistant_turn_failed", error=str(e))
 
@@ -2142,7 +2159,8 @@ Provide a unified, well-structured response that combines all the specialist fin
                     last_response=framed["text"][:500],
                     intent=intent,
                     customer_id=customer_id,
-                )
+                ),
+                timeout=Config.GRPC_TIMEOUT_RECOMMENDATION,
             )
             recommendations = list(rec_response.suggestions)
         except Exception as e:
@@ -2174,7 +2192,8 @@ Provide a unified, well-structured response that combines all the specialist fin
         # Get the last user query from history
         try:
             history_resp = memory_stub.GetConversationHistory(
-                memory_pb2.GetHistoryRequest(session_id=session_id, limit=5)
+                memory_pb2.GetHistoryRequest(session_id=session_id, limit=5),
+                timeout=Config.GRPC_TIMEOUT_MEMORY,
             )
             # Find the last user message
             last_query = ""
@@ -2206,7 +2225,8 @@ Provide a unified, well-structured response that combines all the specialist fin
         # Get session info to extract customer_id
         try:
             session_resp = memory_stub.GetSession(
-                memory_pb2.GetSessionRequest(session_id=session_id)
+                memory_pb2.GetSessionRequest(session_id=session_id),
+                timeout=Config.GRPC_TIMEOUT_MEMORY,
             )
             customer_id = session_resp.customer_id
         except Exception:

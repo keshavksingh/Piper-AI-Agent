@@ -5,6 +5,8 @@ import time
 from unittest.mock import patch, MagicMock
 
 import pytest
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
 
 from recommendation_service.server import (
     RecommendationServiceServicer,
@@ -1548,11 +1550,13 @@ class TestCustomerProfile:
 
         memory1 = MagicMock()
         memory1.key_topics = ["UltraWasher 8262", "price comparison"]
-        memory1.metadata = json.dumps({"intents": ["product_inquiry", "price_check"], "tools_used": ["product_search"]})
+        _meta1 = Struct()
+        json_format.ParseDict({"intents": ["product_inquiry", "price_check"], "tools_used": ["product_search"]}, _meta1)
+        memory1.metadata = _meta1
 
         memory2 = MagicMock()
         memory2.key_topics = ["PowerDrill 5641"]
-        memory2.metadata = "{}"
+        memory2.metadata = Struct()  # empty struct
 
         mem_stub.GetEpisodicMemories.return_value = MagicMock(memories=[memory1, memory2])
 

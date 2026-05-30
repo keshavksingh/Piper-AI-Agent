@@ -6,6 +6,8 @@ from unittest.mock import patch, MagicMock
 
 import grpc
 import pytest
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
 
 from tool_service.server import (
     ToolServiceServicer,
@@ -15,6 +17,14 @@ from tool_service.server import (
     tool_product_compare,
     TOOL_HANDLERS,
 )
+
+
+def _make_struct(d):
+    """Build a protobuf Struct from a dict."""
+    s = Struct()
+    if d:
+        json_format.ParseDict(d, s)
+    return s
 
 
 @pytest.fixture
@@ -78,7 +88,7 @@ class TestExecuteTool:
         request = MagicMock()
         request.tool_name = "product_search"
         request.session_id = "sess-1"
-        request.parameters = json.dumps({"query": "widget", "top_k": 3})
+        request.parameters = _make_struct({"query": "widget", "top_k": 3})
 
         response = servicer.ExecuteTool(request, mock_context)
         assert response.success is True
@@ -101,7 +111,7 @@ class TestExecuteTool:
         request = MagicMock()
         request.tool_name = "price_lookup"
         request.session_id = "sess-1"
-        request.parameters = json.dumps({"product_name": "Widget"})
+        request.parameters = _make_struct({"product_name": "Widget"})
 
         response = servicer.ExecuteTool(request, mock_context)
         assert response.success is True
@@ -125,7 +135,7 @@ class TestExecuteTool:
         request = MagicMock()
         request.tool_name = "warranty_check"
         request.session_id = "sess-1"
-        request.parameters = json.dumps({"product_name": "Widget"})
+        request.parameters = _make_struct({"product_name": "Widget"})
 
         response = servicer.ExecuteTool(request, mock_context)
         assert response.success is True
@@ -150,7 +160,7 @@ class TestExecuteTool:
         request = MagicMock()
         request.tool_name = "product_compare"
         request.session_id = "sess-1"
-        request.parameters = json.dumps({"product_names": ["Widget A", "Widget B"]})
+        request.parameters = _make_struct({"product_names": ["Widget A", "Widget B"]})
 
         response = servicer.ExecuteTool(request, mock_context)
         assert response.success is True
@@ -161,21 +171,22 @@ class TestExecuteTool:
         request = MagicMock()
         request.tool_name = "nonexistent_tool"
         request.session_id = "sess-1"
-        request.parameters = "{}"
+        request.parameters = _make_struct({})
 
         response = servicer.ExecuteTool(request, mock_context)
         assert response.success is False
         assert "Unknown tool" in response.error
 
-    def test_invalid_json_params(self, servicer, mock_context):
+    def test_empty_params(self, servicer, mock_context):
+        """Empty Struct parameters should yield an empty dict."""
         request = MagicMock()
-        request.tool_name = "product_search"
+        request.tool_name = "nonexistent_tool"
         request.session_id = "sess-1"
-        request.parameters = "not json {"
+        request.parameters = _make_struct({})
 
         response = servicer.ExecuteTool(request, mock_context)
         assert response.success is False
-        assert "Invalid JSON" in response.error
+        assert "Unknown tool" in response.error
 
     @patch("tool_service.server.get_pg_conn")
     @patch("tool_service.server.get_knowledge_stub")
@@ -192,7 +203,7 @@ class TestExecuteTool:
         request = MagicMock()
         request.tool_name = "product_search"
         request.session_id = "sess-1"
-        request.parameters = json.dumps({"query": "test"})
+        request.parameters = _make_struct({"query": "test"})
 
         response = servicer.ExecuteTool(request, mock_context)
         assert response.success is False
@@ -217,7 +228,7 @@ class TestExecuteTool:
         request = MagicMock()
         request.tool_name = "product_search"
         request.session_id = "sess-1"
-        request.parameters = json.dumps({"query": "test"})
+        request.parameters = _make_struct({"query": "test"})
 
         servicer.ExecuteTool(request, mock_context)
         # _log_execution should insert into tool_execution_logs
