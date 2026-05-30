@@ -4,8 +4,26 @@ import json
 from unittest.mock import patch, MagicMock
 
 import pytest
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
 
 from agent_service.server import AgentServiceServicer
+
+
+def _make_struct(d):
+    """Build a protobuf Struct from a dict."""
+    s = Struct()
+    if d:
+        json_format.ParseDict(d, s)
+    return s
+
+
+class _MockToolCall:
+    """Lightweight mock for memory_pb2.ToolCall."""
+    def __init__(self, tool_name):
+        self.tool_name = tool_name
+        self.arguments = Struct()
+        self.result = ""
 
 
 def _mock_tool(name, description, parameter_schema):
@@ -13,7 +31,13 @@ def _mock_tool(name, description, parameter_schema):
     t = MagicMock()
     t.name = name
     t.description = description
-    t.parameter_schema = parameter_schema
+    # parameter_schema is now a Struct
+    if isinstance(parameter_schema, str):
+        try:
+            parameter_schema = json.loads(parameter_schema)
+        except (json.JSONDecodeError, TypeError):
+            parameter_schema = {}
+    t.parameter_schema = _make_struct(parameter_schema if isinstance(parameter_schema, dict) else {})
     return t
 
 
@@ -1161,14 +1185,14 @@ class TestConversationContextPreservation:
         prev_user.role = "user"
         prev_user.content = "Compare MegaBlender models"
         prev_user.intent = ""
-        prev_user.tool_calls = ""
+        prev_user.tool_calls = []
         prev_user.created_at = "2024-01-01T10:00:00"
 
         prev_assistant = MagicMock()
         prev_assistant.role = "assistant"
         prev_assistant.content = "MegaBlender Pro costs $199 and MegaBlender Basic costs $99. The Pro has more features."
         prev_assistant.intent = "comparison"
-        prev_assistant.tool_calls = json.dumps([{"tool": "product_compare"}])
+        prev_assistant.tool_calls = [_MockToolCall("product_compare")]
         prev_assistant.created_at = "2024-01-01T10:00:05"
 
         mem_stub.GetConversationHistory.return_value = MagicMock(turns=[prev_user, prev_assistant])
@@ -1229,14 +1253,14 @@ class TestConversationContextPreservation:
         prev_user.role = "user"
         prev_user.content = "Show me vacuum cleaners"
         prev_user.intent = ""
-        prev_user.tool_calls = ""
+        prev_user.tool_calls = []
         prev_user.created_at = ""
 
         prev_assistant = MagicMock()
         prev_assistant.role = "assistant"
         prev_assistant.content = "We have RoboCleaner and SuperVac."
         prev_assistant.intent = "product_inquiry"
-        prev_assistant.tool_calls = json.dumps([{"tool": "product_search"}])
+        prev_assistant.tool_calls = [_MockToolCall("product_search")]
         prev_assistant.created_at = ""
 
         mem_stub.GetConversationHistory.return_value = MagicMock(turns=[prev_user, prev_assistant])
@@ -1289,14 +1313,14 @@ class TestConversationContextPreservation:
         prev_user.role = "user"
         prev_user.content = "Give me more details on UltraWasher 2503"
         prev_user.intent = ""
-        prev_user.tool_calls = ""
+        prev_user.tool_calls = []
         prev_user.created_at = ""
 
         prev_assistant = MagicMock()
         prev_assistant.role = "assistant"
         prev_assistant.content = "The UltraWasher 2503 is priced at $349 with 24 months warranty."
         prev_assistant.intent = "product_inquiry"
-        prev_assistant.tool_calls = json.dumps([{"tool": "product_search"}])
+        prev_assistant.tool_calls = [_MockToolCall("product_search")]
         prev_assistant.created_at = ""
 
         mem_stub.GetConversationHistory.return_value = MagicMock(turns=[prev_user, prev_assistant])
@@ -1369,7 +1393,7 @@ class TestConversationContextPreservation:
         prev_assistant.role = "assistant"
         prev_assistant.content = "The UltraWasher 2503 is priced at $349."
         prev_assistant.intent = "product_inquiry"
-        prev_assistant.tool_calls = ""
+        prev_assistant.tool_calls = []
         prev_assistant.created_at = ""
 
         mem_stub.GetConversationHistory.return_value = MagicMock(turns=[prev_assistant])
@@ -1425,7 +1449,7 @@ class TestFollowUpNeverTriggersClarification:
         prev_assistant.role = "assistant"
         prev_assistant.content = "Here are the blender options."
         prev_assistant.intent = "product_inquiry"
-        prev_assistant.tool_calls = json.dumps([{"tool": "product_search"}])
+        prev_assistant.tool_calls = [_MockToolCall("product_search")]
         prev_assistant.created_at = ""
 
         mem_stub.GetConversationHistory.return_value = MagicMock(turns=[prev_assistant])
@@ -1522,28 +1546,28 @@ class TestSessionQueryHandling:
         turn1.role = "user"
         turn1.content = "Tell me about MegaBlender"
         turn1.intent = ""
-        turn1.tool_calls = ""
+        turn1.tool_calls = []
         turn1.created_at = ""
 
         turn2 = MagicMock()
         turn2.role = "assistant"
         turn2.content = "MegaBlender is a great kitchen blender."
         turn2.intent = "product_inquiry"
-        turn2.tool_calls = json.dumps([{"tool": "product_search"}])
+        turn2.tool_calls = [_MockToolCall("product_search")]
         turn2.created_at = ""
 
         turn3 = MagicMock()
         turn3.role = "user"
         turn3.content = "What about the warranty?"
         turn3.intent = ""
-        turn3.tool_calls = ""
+        turn3.tool_calls = []
         turn3.created_at = ""
 
         turn4 = MagicMock()
         turn4.role = "assistant"
         turn4.content = "MegaBlender has 24 months warranty."
         turn4.intent = "warranty_question"
-        turn4.tool_calls = json.dumps([{"tool": "warranty_check"}])
+        turn4.tool_calls = [_MockToolCall("warranty_check")]
         turn4.created_at = ""
 
         mem_stub.GetConversationHistory.return_value = MagicMock(

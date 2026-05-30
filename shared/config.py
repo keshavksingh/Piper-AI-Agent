@@ -45,11 +45,15 @@ class Config:
     # Redis
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
     SESSION_TTL_SECONDS: int = _safe_int("SESSION_TTL_SECONDS", 1800)
+    REDIS_SOCKET_TIMEOUT: float = _safe_float("REDIS_SOCKET_TIMEOUT", 5.0)
+    REDIS_CONNECT_TIMEOUT: float = _safe_float("REDIS_CONNECT_TIMEOUT", 5.0)
 
     # PostgreSQL (relational + pgvector)
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL", "postgresql://piper:piper@postgres:5432/piper"
     )
+    DB_CONNECT_TIMEOUT: int = _safe_int("DB_CONNECT_TIMEOUT", 10)
+    DB_STATEMENT_TIMEOUT_MS: int = _safe_int("DB_STATEMENT_TIMEOUT_MS", 5000)
 
     # TimescaleDB (immutable episodic memory + audit trail)
     TIMESCALEDB_URL: str = os.getenv(
@@ -101,6 +105,18 @@ class Config:
 
     # Evaluation Storage
     EVALUATION_STORAGE_ENABLED: bool = os.getenv("EVALUATION_STORAGE_ENABLED", "true").lower() == "true"
+
+    # Timeouts — gRPC calls (seconds)
+    GRPC_TIMEOUT_LLM: float = _safe_float("GRPC_TIMEOUT_LLM", 60.0)
+    GRPC_TIMEOUT_TOOL: float = _safe_float("GRPC_TIMEOUT_TOOL", 30.0)
+    GRPC_TIMEOUT_MEMORY: float = _safe_float("GRPC_TIMEOUT_MEMORY", 15.0)
+    GRPC_TIMEOUT_KNOWLEDGE: float = _safe_float("GRPC_TIMEOUT_KNOWLEDGE", 15.0)
+    GRPC_TIMEOUT_RECOMMENDATION: float = _safe_float("GRPC_TIMEOUT_RECOMMENDATION", 15.0)
+    GRPC_TIMEOUT_AGENT: float = _safe_float("GRPC_TIMEOUT_AGENT", 120.0)
+
+    # Timeouts — external APIs (seconds)
+    ANTHROPIC_API_TIMEOUT: float = _safe_float("ANTHROPIC_API_TIMEOUT", 60.0)
+    VOYAGE_API_TIMEOUT: float = _safe_float("VOYAGE_API_TIMEOUT", 30.0)
 
     # Service addresses
     AGENT_SERVICE_ADDR: str = os.getenv("AGENT_SERVICE_ADDR", "agent_service:50054")

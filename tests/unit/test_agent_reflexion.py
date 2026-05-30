@@ -4,8 +4,18 @@ import json
 from unittest.mock import patch, MagicMock
 
 import pytest
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
 
 from agent_service.server import AgentServiceServicer
+
+
+def _make_struct(d):
+    """Build a protobuf Struct from a dict."""
+    s = Struct()
+    if d:
+        json_format.ParseDict(d, s)
+    return s
 
 
 @pytest.fixture
@@ -27,7 +37,7 @@ class TestGetReflexionInsights:
         memory = MagicMock()
         memory.summary = "Always include price when answering product queries"
         memory.key_topics = ["price", "product"]
-        memory.metadata = json.dumps({"intent": "product_inquiry"})
+        memory.metadata = _make_struct({"intent": "product_inquiry"})
 
         stub.GetEpisodicMemories.return_value = MagicMock(memories=[memory])
 
@@ -47,13 +57,13 @@ class TestGetReflexionInsights:
         mem1 = MagicMock()
         mem1.summary = "Relevant insight"
         mem1.key_topics = ["unrelated"]
-        mem1.metadata = json.dumps({"intent": "price_check"})
+        mem1.metadata = _make_struct({"intent": "price_check"})
 
         # Memory with non-matching intent
         mem2 = MagicMock()
         mem2.summary = "Other insight"
         mem2.key_topics = ["other"]
-        mem2.metadata = json.dumps({"intent": "warranty_question"})
+        mem2.metadata = _make_struct({"intent": "warranty_question"})
 
         stub.GetEpisodicMemories.return_value = MagicMock(memories=[mem1, mem2])
 
@@ -71,7 +81,7 @@ class TestGetReflexionInsights:
         mem = MagicMock()
         mem.summary = "Topic-matched insight"
         mem.key_topics = ["warranty"]
-        mem.metadata = json.dumps({"intent": "other"})
+        mem.metadata = _make_struct({"intent": "other"})
 
         stub.GetEpisodicMemories.return_value = MagicMock(memories=[mem])
 
@@ -91,7 +101,7 @@ class TestGetReflexionInsights:
         mem = MagicMock()
         mem.summary = "Fallback insight"
         mem.key_topics = ["xyz"]
-        mem.metadata = json.dumps({"intent": "abc"})
+        mem.metadata = _make_struct({"intent": "abc"})
 
         stub.GetEpisodicMemories.return_value = MagicMock(memories=[mem])
 

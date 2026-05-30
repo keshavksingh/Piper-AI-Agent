@@ -5,8 +5,18 @@ import time
 from unittest.mock import patch, MagicMock
 
 import pytest
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
 
 from agent_service.server import AgentServiceServicer
+
+
+def _make_struct(d):
+    """Build a protobuf Struct from a dict."""
+    s = Struct()
+    if d:
+        json_format.ParseDict(d, s)
+    return s
 
 
 def _mock_tool(name, description, parameter_schema):
@@ -14,7 +24,13 @@ def _mock_tool(name, description, parameter_schema):
     t = MagicMock()
     t.name = name
     t.description = description
-    t.parameter_schema = parameter_schema
+    # parameter_schema is now a Struct — convert string/dict to Struct
+    if isinstance(parameter_schema, str):
+        try:
+            parameter_schema = json.loads(parameter_schema)
+        except (json.JSONDecodeError, TypeError):
+            parameter_schema = {}
+    t.parameter_schema = _make_struct(parameter_schema if isinstance(parameter_schema, dict) else {})
     return t
 
 

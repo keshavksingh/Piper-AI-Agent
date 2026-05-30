@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import threading
 import grpc
 import numpy as np
 from concurrent import futures
@@ -11,6 +12,7 @@ import voyageai
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 sys.path.append("..")
 load_dotenv()
@@ -25,13 +27,39 @@ log = setup_logging("knowledge_service")
 
 # ── Voyage AI Client (Anthropic-recommended embedding provider) ──
 
-vo_client = voyageai.Client(api_key=Config.VOYAGE_API_KEY)
+vo_client = voyageai.Client(api_key=Config.VOYAGE_API_KEY, timeout=Config.VOYAGE_API_TIMEOUT)
 
 
-# ── Database Connection ───────────────────────────────────────────
+# ── Database Connection Pool ──────────────────────────────────────
+
+_pg_pool = None
+_pg_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        with _pg_lock:
+            if _pg_pool is None:
+                _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2, maxconn=10, dsn=Config.DATABASE_URL,
+                    connect_timeout=Config.DB_CONNECT_TIMEOUT,
+                    options=f"-c statement_timeout={Config.DB_STATEMENT_TIMEOUT_MS}",
+                )
+    return _pg_pool
+
 
 def get_pg_conn():
-    return psycopg2.connect(Config.DATABASE_URL)
+    return _get_pool().getconn()
+
+
+def put_pg_conn(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    if _pg_pool is not None:
+        _pg_pool.putconn(conn)
 
 
 # ── Embedding ─────────────────────────────────────────────────────
@@ -84,7 +112,7 @@ class KnowledgeServiceServicer(pb2_grpc.KnowledgeServiceServicer):
                     )
                     rows = cur.fetchall()
             finally:
-                conn.close()
+                put_pg_conn(conn)
 
             # Build response
             documents = []

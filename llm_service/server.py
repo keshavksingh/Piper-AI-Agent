@@ -20,7 +20,7 @@ from shared.logging_config import setup_logging
 
 log = setup_logging("llm_service")
 
-client = Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+client = Anthropic(api_key=Config.ANTHROPIC_API_KEY, timeout=Config.ANTHROPIC_API_TIMEOUT)
 
 # ── Default Prompts ───────────────────────────────────────────────
 

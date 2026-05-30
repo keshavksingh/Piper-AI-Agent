@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package tool;
 
+import "google/protobuf/struct.proto";
+
 service ToolService {
   // List all available tools (for agent context)
   rpc ListTools (ListToolsRequest) returns (ListToolsResponse);
@@ -15,7 +17,7 @@ message ListToolsRequest {}
 message ToolDefinition {
   string name = 1;
   string description = 2;
-  string parameter_schema = 3;  // JSON string
+  google.protobuf.Struct parameter_schema = 3;
 }
 
 message ListToolsResponse {
@@ -25,7 +27,7 @@ message ListToolsResponse {
 message ExecuteToolRequest {
   string session_id = 1;
   string tool_name = 2;
-  string parameters = 3;  // JSON string
+  google.protobuf.Struct parameters = 3;
 }
 
 message ExecuteToolResponse {

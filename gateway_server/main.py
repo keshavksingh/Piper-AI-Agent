@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 import grpc
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 sys.path.append("..")
 
@@ -59,10 +60,36 @@ def check_rate_limit(customer_id: str) -> bool:
     return True
 
 
-# ── Database Connection ──────────────────────────────────────────
+# ── Database Connection Pool ─────────────────────────────────────
+
+_pg_pool = None
+_pg_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        with _pg_lock:
+            if _pg_pool is None:
+                _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2, maxconn=10, dsn=Config.DATABASE_URL,
+                    connect_timeout=Config.DB_CONNECT_TIMEOUT,
+                    options=f"-c statement_timeout={Config.DB_STATEMENT_TIMEOUT_MS}",
+                )
+    return _pg_pool
+
 
 def get_pg_conn():
-    return psycopg2.connect(Config.DATABASE_URL)
+    return _get_pool().getconn()
+
+
+def put_pg_conn(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    if _pg_pool is not None:
+        _pg_pool.putconn(conn)
 
 
 # ── gRPC Stubs (cached channels to prevent resource leaks) ────────
@@ -178,7 +205,7 @@ async def login(request: Request):
             )
             user = cur.fetchone()
     finally:
-        conn.close()
+        put_pg_conn(conn)
 
     if not user:
         log.warning("login_failed", email=email, reason="user_not_found")
@@ -200,7 +227,7 @@ async def login(request: Request):
                 cur.execute("UPDATE users SET last_login_at = NOW() WHERE id = %s", (str(user["id"]),))
             conn.commit()
         finally:
-            conn.close()
+            put_pg_conn(conn)
     except Exception as e:
         log.warning("login_update_last_login_failed", error=str(e), user_id=str(user["id"]))
 
@@ -270,7 +297,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     memory_stub = get_memory_stub()
                     session_resp = memory_stub.CreateSession(
-                        memory_pb2.CreateSessionRequest(customer_id=customer_id)
+                        memory_pb2.CreateSessionRequest(customer_id=customer_id),
+                        timeout=Config.GRPC_TIMEOUT_MEMORY,
                     )
                     session_id = session_resp.session_id
 
@@ -286,7 +314,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             rec_pb2.StartRecommendationRequest(
                                 customer_id=customer_id,
                                 session_id=session_id,
-                            )
+                            ),
+                            timeout=Config.GRPC_TIMEOUT_RECOMMENDATION,
                         )
                         await websocket.send_text(json.dumps({
                             "type": "recommendations",
@@ -343,7 +372,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
 
                     # Stream agent events to the client (async to avoid blocking the event loop)
-                    async for event in async_grpc_stream(agent_stub.ProcessQuery(agent_request)):
+                    async for event in async_grpc_stream(agent_stub.ProcessQuery(agent_request, timeout=Config.GRPC_TIMEOUT_AGENT)):
                         await websocket.send_text(json.dumps({
                             "type": event.type,
                             "payload": event.payload,
@@ -384,7 +413,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "payload": json.dumps({"clarification": True}),
                     }))
 
-                    async for event in async_grpc_stream(agent_stub.SubmitClarification(clarification)):
+                    async for event in async_grpc_stream(agent_stub.SubmitClarification(clarification, timeout=Config.GRPC_TIMEOUT_AGENT)):
                         await websocket.send_text(json.dumps({
                             "type": event.type,
                             "payload": event.payload,

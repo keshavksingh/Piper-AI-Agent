@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package memory;
 
+import "google/protobuf/struct.proto";
+
 service MemoryService {
   // Session management (PostgreSQL)
   rpc CreateSession (CreateSessionRequest) returns (SessionResponse);
@@ -45,12 +47,18 @@ message SessionResponse {
 
 // --- Conversation Turns ---
 
+message ToolCall {
+  string tool_name = 1;
+  google.protobuf.Struct arguments = 2;
+  string result = 3;
+}
+
 message ConversationTurn {
   string role = 1;      // "user", "assistant", "system"
   string content = 2;
   string intent = 3;
   float confidence = 4;
-  string tool_calls = 5;  // JSON string
+  repeated ToolCall tool_calls = 5;
   string created_at = 6;
 }
 
@@ -60,7 +68,7 @@ message AddTurnRequest {
   string content = 3;
   string intent = 4;
   float confidence = 5;
-  string tool_calls = 6;  // JSON string
+  repeated ToolCall tool_calls = 6;
 }
 
 message AddTurnResponse {
@@ -85,7 +93,7 @@ message StoreEpisodicRequest {
   string summary = 4;
   repeated string key_topics = 5;
   string resolution_status = 6;
-  string metadata = 7;     // JSON string for additional context
+  google.protobuf.Struct metadata = 7;
 }
 
 message StoreEpisodicResponse {
@@ -108,7 +116,7 @@ message EpisodicMemory {
   string summary = 3;
   repeated string key_topics = 4;
   string resolution_status = 5;
-  string metadata = 6;     // JSON string
+  google.protobuf.Struct metadata = 6;
   string created_at = 7;
 }
 
@@ -118,7 +126,7 @@ message AuditEventRequest {
   string session_id = 1;
   string customer_id = 2;
   string event_type = 3;   // "session_created", "turn_user", "intent_classified", "tool_executed", etc.
-  string event_data = 4;   // JSON string with event-specific payload
+  google.protobuf.Struct event_data = 4;
 }
 
 message AuditEventResponse {
@@ -140,6 +148,6 @@ message AuditEvent {
   string session_id = 2;
   string customer_id = 3;
   string event_type = 4;
-  string event_data = 5;   // JSON string
+  google.protobuf.Struct event_data = 5;
   string event_time = 6;
 }

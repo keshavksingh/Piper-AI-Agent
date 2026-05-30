@@ -22,53 +22,56 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from google.protobuf import struct_pb2 as google_dot_protobuf_dot_struct__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14memory_service.proto\x12\x06memory\"+\n\x14\x43reateSessionRequest\x12\x13\n\x0b\x63ustomer_id\x18\x01 \x01(\t\"\'\n\x11GetSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\")\n\x13TouchSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"v\n\x0fSessionResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x63ustomer_id\x18\x02 \x01(\t\x12\x12\n\ncreated_at\x18\x03 \x01(\t\x12\x16\n\x0elast_active_at\x18\x04 \x01(\t\x12\x0e\n\x06is_new\x18\x05 \x01(\x08\"}\n\x10\x43onversationTurn\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x0e\n\x06intent\x18\x03 \x01(\t\x12\x12\n\nconfidence\x18\x04 \x01(\x02\x12\x12\n\ntool_calls\x18\x05 \x01(\t\x12\x12\n\ncreated_at\x18\x06 \x01(\t\"{\n\x0e\x41\x64\x64TurnRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04role\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\t\x12\x0e\n\x06intent\x18\x04 \x01(\t\x12\x12\n\nconfidence\x18\x05 \x01(\x02\x12\x12\n\ntool_calls\x18\x06 \x01(\t\"\"\n\x0f\x41\x64\x64TurnResponse\x12\x0f\n\x07turn_id\x18\x01 \x01(\t\"6\n\x11GetHistoryRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\"=\n\x12GetHistoryResponse\x12\'\n\x05turns\x18\x01 \x03(\x0b\x32\x18.memory.ConversationTurn\"\xa5\x01\n\x14StoreEpisodicRequest\x12\x13\n\x0b\x63ustomer_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x12\n\nevent_type\x18\x03 \x01(\t\x12\x0f\n\x07summary\x18\x04 \x01(\t\x12\x12\n\nkey_topics\x18\x05 \x03(\t\x12\x19\n\x11resolution_status\x18\x06 \x01(\t\x12\x10\n\x08metadata\x18\x07 \x01(\t\"*\n\x15StoreEpisodicResponse\x12\x11\n\tmemory_id\x18\x01 \x01(\t\"L\n\x12GetEpisodicRequest\x12\x13\n\x0b\x63ustomer_id\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\x12\x12\n\nevent_type\x18\x03 \x01(\t\"?\n\x13GetEpisodicResponse\x12(\n\x08memories\x18\x01 \x03(\x0b\x32\x16.memory.EpisodicMemory\"\x9d\x01\n\x0e\x45pisodicMemory\x12\x11\n\tmemory_id\x18\x01 \x01(\t\x12\x12\n\nevent_type\x18\x02 \x01(\t\x12\x0f\n\x07summary\x18\x03 \x01(\t\x12\x12\n\nkey_topics\x18\x04 \x03(\t\x12\x19\n\x11resolution_status\x18\x05 \x01(\t\x12\x10\n\x08metadata\x18\x06 \x01(\t\x12\x12\n\ncreated_at\x18\x07 \x01(\t\"d\n\x11\x41uditEventRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x63ustomer_id\x18\x02 \x01(\t\x12\x12\n\nevent_type\x18\x03 \x01(\t\x12\x12\n\nevent_data\x18\x04 \x01(\t\"&\n\x12\x41uditEventResponse\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\"M\n\x14GetAuditTrailRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x12\n\nevent_type\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\";\n\x15GetAuditTrailResponse\x12\"\n\x06\x65vents\x18\x01 \x03(\x0b\x32\x12.memory.AuditEvent\"\x83\x01\n\nAuditEvent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x13\n\x0b\x63ustomer_id\x18\x03 \x01(\t\x12\x12\n\nevent_type\x18\x04 \x01(\t\x12\x12\n\nevent_data\x18\x05 \x01(\t\x12\x12\n\nevent_time\x18\x06 \x01(\t2\xbc\x05\n\rMemoryService\x12\x46\n\rCreateSession\x12\x1c.memory.CreateSessionRequest\x1a\x17.memory.SessionResponse\x12@\n\nGetSession\x12\x19.memory.GetSessionRequest\x1a\x17.memory.SessionResponse\x12\x44\n\x0cTouchSession\x12\x1b.memory.TouchSessionRequest\x1a\x17.memory.SessionResponse\x12\x46\n\x13\x41\x64\x64\x43onversationTurn\x12\x16.memory.AddTurnRequest\x1a\x17.memory.AddTurnResponse\x12O\n\x16GetConversationHistory\x12\x19.memory.GetHistoryRequest\x1a\x1a.memory.GetHistoryResponse\x12R\n\x13StoreEpisodicMemory\x12\x1c.memory.StoreEpisodicRequest\x1a\x1d.memory.StoreEpisodicResponse\x12N\n\x13GetEpisodicMemories\x12\x1a.memory.GetEpisodicRequest\x1a\x1b.memory.GetEpisodicResponse\x12I\n\x10\x41ppendAuditEvent\x12\x19.memory.AuditEventRequest\x1a\x1a.memory.AuditEventResponse\x12S\n\x14GetSessionAuditTrail\x12\x1c.memory.GetAuditTrailRequest\x1a\x1d.memory.GetAuditTrailResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14memory_service.proto\x12\x06memory\x1a\x1cgoogle/protobuf/struct.proto\"+\n\x14\x43reateSessionRequest\x12\x13\n\x0b\x63ustomer_id\x18\x01 \x01(\t\"\'\n\x11GetSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\")\n\x13TouchSessionRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"v\n\x0fSessionResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x63ustomer_id\x18\x02 \x01(\t\x12\x12\n\ncreated_at\x18\x03 \x01(\t\x12\x16\n\x0elast_active_at\x18\x04 \x01(\t\x12\x0e\n\x06is_new\x18\x05 \x01(\x08\"Y\n\x08ToolCall\x12\x11\n\ttool_name\x18\x01 \x01(\t\x12*\n\targuments\x18\x02 \x01(\x0b\x32\x17.google.protobuf.Struct\x12\x0e\n\x06result\x18\x03 \x01(\t\"\x8f\x01\n\x10\x43onversationTurn\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x0e\n\x06intent\x18\x03 \x01(\t\x12\x12\n\nconfidence\x18\x04 \x01(\x02\x12$\n\ntool_calls\x18\x05 \x03(\x0b\x32\x10.memory.ToolCall\x12\x12\n\ncreated_at\x18\x06 \x01(\t\"\x8d\x01\n\x0e\x41\x64\x64TurnRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04role\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\t\x12\x0e\n\x06intent\x18\x04 \x01(\t\x12\x12\n\nconfidence\x18\x05 \x01(\x02\x12$\n\ntool_calls\x18\x06 \x03(\x0b\x32\x10.memory.ToolCall\"\"\n\x0f\x41\x64\x64TurnResponse\x12\x0f\n\x07turn_id\x18\x01 \x01(\t\"6\n\x11GetHistoryRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\"=\n\x12GetHistoryResponse\x12\'\n\x05turns\x18\x01 \x03(\x0b\x32\x18.memory.ConversationTurn\"\xbe\x01\n\x14StoreEpisodicRequest\x12\x13\n\x0b\x63ustomer_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x12\n\nevent_type\x18\x03 \x01(\t\x12\x0f\n\x07summary\x18\x04 \x01(\t\x12\x12\n\nkey_topics\x18\x05 \x03(\t\x12\x19\n\x11resolution_status\x18\x06 \x01(\t\x12)\n\x08metadata\x18\x07 \x01(\x0b\x32\x17.google.protobuf.Struct\"*\n\x15StoreEpisodicResponse\x12\x11\n\tmemory_id\x18\x01 \x01(\t\"L\n\x12GetEpisodicRequest\x12\x13\n\x0b\x63ustomer_id\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\x12\x12\n\nevent_type\x18\x03 \x01(\t\"?\n\x13GetEpisodicResponse\x12(\n\x08memories\x18\x01 \x03(\x0b\x32\x16.memory.EpisodicMemory\"\xb6\x01\n\x0e\x45pisodicMemory\x12\x11\n\tmemory_id\x18\x01 \x01(\t\x12\x12\n\nevent_type\x18\x02 \x01(\t\x12\x0f\n\x07summary\x18\x03 \x01(\t\x12\x12\n\nkey_topics\x18\x04 \x03(\t\x12\x19\n\x11resolution_status\x18\x05 \x01(\t\x12)\n\x08metadata\x18\x06 \x01(\x0b\x32\x17.google.protobuf.Struct\x12\x12\n\ncreated_at\x18\x07 \x01(\t\"}\n\x11\x41uditEventRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x63ustomer_id\x18\x02 \x01(\t\x12\x12\n\nevent_type\x18\x03 \x01(\t\x12+\n\nevent_data\x18\x04 \x01(\x0b\x32\x17.google.protobuf.Struct\"&\n\x12\x41uditEventResponse\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\"M\n\x14GetAuditTrailRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x12\n\nevent_type\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\";\n\x15GetAuditTrailResponse\x12\"\n\x06\x65vents\x18\x01 \x03(\x0b\x32\x12.memory.AuditEvent\"\x9c\x01\n\nAuditEvent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x13\n\x0b\x63ustomer_id\x18\x03 \x01(\t\x12\x12\n\nevent_type\x18\x04 \x01(\t\x12+\n\nevent_data\x18\x05 \x01(\x0b\x32\x17.google.protobuf.Struct\x12\x12\n\nevent_time\x18\x06 \x01(\t2\xbc\x05\n\rMemoryService\x12\x46\n\rCreateSession\x12\x1c.memory.CreateSessionRequest\x1a\x17.memory.SessionResponse\x12@\n\nGetSession\x12\x19.memory.GetSessionRequest\x1a\x17.memory.SessionResponse\x12\x44\n\x0cTouchSession\x12\x1b.memory.TouchSessionRequest\x1a\x17.memory.SessionResponse\x12\x46\n\x13\x41\x64\x64\x43onversationTurn\x12\x16.memory.AddTurnRequest\x1a\x17.memory.AddTurnResponse\x12O\n\x16GetConversationHistory\x12\x19.memory.GetHistoryRequest\x1a\x1a.memory.GetHistoryResponse\x12R\n\x13StoreEpisodicMemory\x12\x1c.memory.StoreEpisodicRequest\x1a\x1d.memory.StoreEpisodicResponse\x12N\n\x13GetEpisodicMemories\x12\x1a.memory.GetEpisodicRequest\x1a\x1b.memory.GetEpisodicResponse\x12I\n\x10\x41ppendAuditEvent\x12\x19.memory.AuditEventRequest\x1a\x1a.memory.AuditEventResponse\x12S\n\x14GetSessionAuditTrail\x12\x1c.memory.GetAuditTrailRequest\x1a\x1d.memory.GetAuditTrailResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'memory_service_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_CREATESESSIONREQUEST']._serialized_start=32
-  _globals['_CREATESESSIONREQUEST']._serialized_end=75
-  _globals['_GETSESSIONREQUEST']._serialized_start=77
-  _globals['_GETSESSIONREQUEST']._serialized_end=116
-  _globals['_TOUCHSESSIONREQUEST']._serialized_start=118
-  _globals['_TOUCHSESSIONREQUEST']._serialized_end=159
-  _globals['_SESSIONRESPONSE']._serialized_start=161
-  _globals['_SESSIONRESPONSE']._serialized_end=279
-  _globals['_CONVERSATIONTURN']._serialized_start=281
-  _globals['_CONVERSATIONTURN']._serialized_end=406
-  _globals['_ADDTURNREQUEST']._serialized_start=408
-  _globals['_ADDTURNREQUEST']._serialized_end=531
-  _globals['_ADDTURNRESPONSE']._serialized_start=533
-  _globals['_ADDTURNRESPONSE']._serialized_end=567
-  _globals['_GETHISTORYREQUEST']._serialized_start=569
-  _globals['_GETHISTORYREQUEST']._serialized_end=623
-  _globals['_GETHISTORYRESPONSE']._serialized_start=625
-  _globals['_GETHISTORYRESPONSE']._serialized_end=686
-  _globals['_STOREEPISODICREQUEST']._serialized_start=689
-  _globals['_STOREEPISODICREQUEST']._serialized_end=854
-  _globals['_STOREEPISODICRESPONSE']._serialized_start=856
-  _globals['_STOREEPISODICRESPONSE']._serialized_end=898
-  _globals['_GETEPISODICREQUEST']._serialized_start=900
-  _globals['_GETEPISODICREQUEST']._serialized_end=976
-  _globals['_GETEPISODICRESPONSE']._serialized_start=978
-  _globals['_GETEPISODICRESPONSE']._serialized_end=1041
-  _globals['_EPISODICMEMORY']._serialized_start=1044
-  _globals['_EPISODICMEMORY']._serialized_end=1201
-  _globals['_AUDITEVENTREQUEST']._serialized_start=1203
-  _globals['_AUDITEVENTREQUEST']._serialized_end=1303
-  _globals['_AUDITEVENTRESPONSE']._serialized_start=1305
-  _globals['_AUDITEVENTRESPONSE']._serialized_end=1343
-  _globals['_GETAUDITTRAILREQUEST']._serialized_start=1345
-  _globals['_GETAUDITTRAILREQUEST']._serialized_end=1422
-  _globals['_GETAUDITTRAILRESPONSE']._serialized_start=1424
-  _globals['_GETAUDITTRAILRESPONSE']._serialized_end=1483
-  _globals['_AUDITEVENT']._serialized_start=1486
-  _globals['_AUDITEVENT']._serialized_end=1617
-  _globals['_MEMORYSERVICE']._serialized_start=1620
-  _globals['_MEMORYSERVICE']._serialized_end=2320
+  _globals['_CREATESESSIONREQUEST']._serialized_start=62
+  _globals['_CREATESESSIONREQUEST']._serialized_end=105
+  _globals['_GETSESSIONREQUEST']._serialized_start=107
+  _globals['_GETSESSIONREQUEST']._serialized_end=146
+  _globals['_TOUCHSESSIONREQUEST']._serialized_start=148
+  _globals['_TOUCHSESSIONREQUEST']._serialized_end=189
+  _globals['_SESSIONRESPONSE']._serialized_start=191
+  _globals['_SESSIONRESPONSE']._serialized_end=309
+  _globals['_TOOLCALL']._serialized_start=311
+  _globals['_TOOLCALL']._serialized_end=400
+  _globals['_CONVERSATIONTURN']._serialized_start=403
+  _globals['_CONVERSATIONTURN']._serialized_end=546
+  _globals['_ADDTURNREQUEST']._serialized_start=549
+  _globals['_ADDTURNREQUEST']._serialized_end=690
+  _globals['_ADDTURNRESPONSE']._serialized_start=692
+  _globals['_ADDTURNRESPONSE']._serialized_end=726
+  _globals['_GETHISTORYREQUEST']._serialized_start=728
+  _globals['_GETHISTORYREQUEST']._serialized_end=782
+  _globals['_GETHISTORYRESPONSE']._serialized_start=784
+  _globals['_GETHISTORYRESPONSE']._serialized_end=845
+  _globals['_STOREEPISODICREQUEST']._serialized_start=848
+  _globals['_STOREEPISODICREQUEST']._serialized_end=1038
+  _globals['_STOREEPISODICRESPONSE']._serialized_start=1040
+  _globals['_STOREEPISODICRESPONSE']._serialized_end=1082
+  _globals['_GETEPISODICREQUEST']._serialized_start=1084
+  _globals['_GETEPISODICREQUEST']._serialized_end=1160
+  _globals['_GETEPISODICRESPONSE']._serialized_start=1162
+  _globals['_GETEPISODICRESPONSE']._serialized_end=1225
+  _globals['_EPISODICMEMORY']._serialized_start=1228
+  _globals['_EPISODICMEMORY']._serialized_end=1410
+  _globals['_AUDITEVENTREQUEST']._serialized_start=1412
+  _globals['_AUDITEVENTREQUEST']._serialized_end=1537
+  _globals['_AUDITEVENTRESPONSE']._serialized_start=1539
+  _globals['_AUDITEVENTRESPONSE']._serialized_end=1577
+  _globals['_GETAUDITTRAILREQUEST']._serialized_start=1579
+  _globals['_GETAUDITTRAILREQUEST']._serialized_end=1656
+  _globals['_GETAUDITTRAILRESPONSE']._serialized_start=1658
+  _globals['_GETAUDITTRAILRESPONSE']._serialized_end=1717
+  _globals['_AUDITEVENT']._serialized_start=1720
+  _globals['_AUDITEVENT']._serialized_end=1876
+  _globals['_MEMORYSERVICE']._serialized_start=1879
+  _globals['_MEMORYSERVICE']._serialized_end=2579
 # @@protoc_insertion_point(module_scope)

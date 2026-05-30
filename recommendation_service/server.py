@@ -9,6 +9,8 @@ from concurrent import futures
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
+from google.protobuf import json_format
 
 sys.path.append("..")
 
@@ -26,8 +28,34 @@ log = setup_logging("recommendation_service")
 
 # ── Connections ───────────────────────────────────────────────────
 
+_pg_pool = None
+_pg_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        with _pg_lock:
+            if _pg_pool is None:
+                _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2, maxconn=10, dsn=Config.DATABASE_URL,
+                    connect_timeout=Config.DB_CONNECT_TIMEOUT,
+                    options=f"-c statement_timeout={Config.DB_STATEMENT_TIMEOUT_MS}",
+                )
+    return _pg_pool
+
+
 def get_pg_conn():
-    return psycopg2.connect(Config.DATABASE_URL)
+    return _get_pool().getconn()
+
+
+def put_pg_conn(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    if _pg_pool is not None:
+        _pg_pool.putconn(conn)
 
 
 def get_memory_stub():
@@ -186,7 +214,7 @@ def _get_product_catalog_summary():
         }
     finally:
         if conn:
-            conn.close()
+            put_pg_conn(conn)
 
 
 # ── Current Focus Extraction ──────────────────────────────────────
@@ -341,7 +369,7 @@ def _build_session_context(session_id):
         return context
     finally:
         if conn:
-            conn.close()
+            put_pg_conn(conn)
 
 
 # ── Customer Profile Builder ─────────────────────────────────────
@@ -362,7 +390,8 @@ def _build_customer_profile(customer_id):
     try:
         memory_stub = get_memory_stub()
         episodic_resp = memory_stub.GetEpisodicMemories(
-            memory_pb2.GetEpisodicRequest(customer_id=customer_id, limit=10)
+            memory_pb2.GetEpisodicRequest(customer_id=customer_id, limit=10),
+            timeout=Config.GRPC_TIMEOUT_MEMORY,
         )
 
         if not episodic_resp.memories:
@@ -381,10 +410,10 @@ def _build_customer_profile(customer_id):
                     if brand.lower() in topic.lower():
                         profile["brands_explored"].add(brand)
 
-            # Extract intents and tools from metadata
-            if mem.metadata:
+            # Extract intents and tools from metadata (now a Struct)
+            if mem.metadata.fields:
                 try:
-                    meta = json.loads(mem.metadata) if isinstance(mem.metadata, str) else mem.metadata
+                    meta = json_format.MessageToDict(mem.metadata)
                     if isinstance(meta, dict):
                         if "intents" in meta:
                             for intent in meta["intents"]:
@@ -392,7 +421,7 @@ def _build_customer_profile(customer_id):
                         if "tools_used" in meta:
                             for tool in meta["tools_used"]:
                                 profile["tools_used_historically"].add(tool)
-                except (json.JSONDecodeError, TypeError):
+                except Exception:
                     pass
 
         return profile
@@ -467,7 +496,7 @@ def _get_cross_user_popular_products(catalog, limit=3):
         return []
     finally:
         if conn:
-            conn.close()
+            put_pg_conn(conn)
 
 
 # ── Co-occurring Products ─────────────────────────────────────────
@@ -541,7 +570,7 @@ def _get_cooccurring_products(current_product, catalog, limit=3):
         return []
     finally:
         if conn:
-            conn.close()
+            put_pg_conn(conn)
 
 
 # ── Premium Showcase Products ─────────────────────────────────────
@@ -590,7 +619,7 @@ def _get_premium_showcase_products(catalog, limit=3):
         return _premium_showcase_from_catalog(catalog, limit)
     finally:
         if conn:
-            conn.close()
+            put_pg_conn(conn)
 
 
 def _premium_showcase_from_catalog(catalog, limit=3):
@@ -691,7 +720,7 @@ def _find_price_alternative(current_product, current_brand, catalog):
 
     finally:
         if conn:
-            conn.close()
+            put_pg_conn(conn)
 
     return _price_alternative_from_catalog(current_product, current_brand, catalog)
 
@@ -940,7 +969,7 @@ class RecommendationServiceServicer(pb2_grpc.RecommendationServiceServicer):
                         if row:
                             customer_id = str(row[0])
                 finally:
-                    conn.close()
+                    put_pg_conn(conn)
             except Exception as e:
                 log.warning("customer_id_lookup_failed", error=str(e))
 

@@ -4,11 +4,15 @@ import json
 import time
 import sys
 import uuid
+import threading
 import grpc
 from concurrent import futures
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf import json_format
 
 sys.path.append("..")
 
@@ -24,10 +28,36 @@ from shared.resilience import create_grpc_channel, grpc_retry
 log = setup_logging("tool_service")
 
 
-# ── Database Connection ───────────────────────────────────────────
+# ── Database Connection Pool ──────────────────────────────────────
+
+_pg_pool = None
+_pg_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        with _pg_lock:
+            if _pg_pool is None:
+                _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2, maxconn=10, dsn=Config.DATABASE_URL,
+                    connect_timeout=Config.DB_CONNECT_TIMEOUT,
+                    options=f"-c statement_timeout={Config.DB_STATEMENT_TIMEOUT_MS}",
+                )
+    return _pg_pool
+
 
 def get_pg_conn():
-    return psycopg2.connect(Config.DATABASE_URL)
+    return _get_pool().getconn()
+
+
+def put_pg_conn(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    if _pg_pool is not None:
+        _pg_pool.putconn(conn)
 
 
 # ── Knowledge Service Stub ────────────────────────────────────────
@@ -42,11 +72,12 @@ def get_knowledge_stub():
 def tool_product_search(params: dict) -> dict:
     """Search products by semantic similarity via Knowledge Service."""
     query = params.get("query", "")
-    top_k = params.get("top_k", 5)
+    top_k = int(params.get("top_k", 5))
 
     stub = get_knowledge_stub()
     response = stub.RetrieveRelevantDocs(
-        knowledge_pb2.KnowledgeRequest(query=query, top_k=top_k)
+        knowledge_pb2.KnowledgeRequest(query=query, top_k=top_k),
+        timeout=Config.GRPC_TIMEOUT_KNOWLEDGE,
     )
 
     products = []
@@ -102,7 +133,7 @@ def tool_price_lookup(params: dict) -> dict:
 
             rows = cur.fetchall()
     finally:
-        conn.close()
+        put_pg_conn(conn)
 
     results = [
         {
@@ -129,7 +160,7 @@ def tool_warranty_check(params: dict) -> dict:
             )
             rows = cur.fetchall()
     finally:
-        conn.close()
+        put_pg_conn(conn)
 
     results = [
         {
@@ -162,7 +193,7 @@ def tool_product_compare(params: dict) -> dict:
             )
             rows = cur.fetchall()
     finally:
-        conn.close()
+        put_pg_conn(conn)
 
     results = [
         {
@@ -201,16 +232,28 @@ class ToolServiceServicer(pb2_grpc.ToolServiceServicer):
                 )
                 rows = cur.fetchall()
         finally:
-            conn.close()
+            put_pg_conn(conn)
 
-        tools = [
-            pb2.ToolDefinition(
+        tools = []
+        for row in rows:
+            td = pb2.ToolDefinition(
                 name=row["name"],
                 description=row["description"],
-                parameter_schema=json.dumps(row["parameter_schema"]) if isinstance(row["parameter_schema"], dict) else row["parameter_schema"],
             )
-            for row in rows
-        ]
+            # Convert parameter_schema to Struct
+            schema_raw = row["parameter_schema"]
+            if isinstance(schema_raw, dict):
+                schema_dict = schema_raw
+            elif isinstance(schema_raw, str) and schema_raw:
+                try:
+                    schema_dict = json.loads(schema_raw)
+                except (json.JSONDecodeError, TypeError):
+                    schema_dict = {}
+            else:
+                schema_dict = {}
+            if schema_dict:
+                json_format.ParseDict(schema_dict, td.parameter_schema)
+            tools.append(td)
 
         return pb2.ListToolsResponse(tools=tools)
 
@@ -223,14 +266,11 @@ class ToolServiceServicer(pb2_grpc.ToolServiceServicer):
 
         log.info("tool_execute_start", tool=tool_name, session_id=session_id)
 
-        # Parse parameters
-        try:
-            params = json.loads(request.parameters) if request.parameters else {}
-        except json.JSONDecodeError:
-            return pb2.ExecuteToolResponse(
-                success=False,
-                error=f"Invalid JSON parameters: {request.parameters}",
-            )
+        # Parse parameters from Struct
+        if request.parameters.fields:
+            params = json_format.MessageToDict(request.parameters)
+        else:
+            params = {}
 
         # Find handler
         handler = TOOL_HANDLERS.get(tool_name)
@@ -301,7 +341,7 @@ class ToolServiceServicer(pb2_grpc.ToolServiceServicer):
             log.warning("log_execution_failed", error=str(e))
         finally:
             if conn:
-                conn.close()
+                put_pg_conn(conn)
 
 
 # ── Server Startup ────────────────────────────────────────────────
